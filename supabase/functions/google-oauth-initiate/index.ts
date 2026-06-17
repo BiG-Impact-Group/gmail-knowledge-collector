@@ -29,13 +29,14 @@ async function buildStateJwt(userId: string, stateSecret: string): Promise<strin
 }
 
 Deno.serve(async (req: Request) => {
+  const corsHeaders = {
+    'Access-Control-Allow-Origin': '*',
+    'Access-Control-Allow-Headers': 'authorization, apikey, content-type, x-client-info',
+    'Access-Control-Allow-Methods': 'POST, OPTIONS',
+  }
+
   if (req.method === 'OPTIONS') {
-    return new Response(null, {
-      headers: {
-        'Access-Control-Allow-Origin': '*',
-        'Access-Control-Allow-Headers': 'authorization',
-      },
-    })
+    return new Response(null, { headers: corsHeaders })
   }
 
   const supabaseUrl = Deno.env.get('SUPABASE_URL')!
@@ -54,7 +55,7 @@ Deno.serve(async (req: Request) => {
 
   const { data: { user }, error: userError } = await supabase.auth.getUser()
   if (userError || !user) {
-    return Response.json({ error: 'Unauthorized' }, { status: 401 })
+    return Response.json({ error: 'Unauthorized' }, { status: 401, headers: corsHeaders })
   }
 
   const state = await buildStateJwt(user.id, stateSecret)
@@ -70,5 +71,5 @@ Deno.serve(async (req: Request) => {
   })
 
   const url = `${GOOGLE_AUTH_URL}?${params.toString()}`
-  return Response.json({ url })
+  return Response.json({ url }, { headers: corsHeaders })
 })
