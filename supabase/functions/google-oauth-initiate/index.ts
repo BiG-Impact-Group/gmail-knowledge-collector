@@ -1,7 +1,11 @@
 import { createClient } from 'https://esm.sh/@supabase/supabase-js@2'
 
 const GOOGLE_AUTH_URL = 'https://accounts.google.com/o/oauth2/v2/auth'
-const GMAIL_SCOPE = 'https://www.googleapis.com/auth/gmail.readonly'
+const SCOPES = [
+  'openid',
+  'email',
+  'https://www.googleapis.com/auth/gmail.readonly',
+].join(' ')
 const REDIRECT_URI = 'https://ybgtzyutbvwfhgtlmnah.supabase.co/functions/v1/google-oauth-callback'
 
 function base64url(data: ArrayBuffer): string {
@@ -64,7 +68,7 @@ Deno.serve(async (req: Request) => {
     client_id: clientId,
     redirect_uri: REDIRECT_URI,
     response_type: 'code',
-    scope: GMAIL_SCOPE,
+    scope: SCOPES,
     access_type: 'offline',
     prompt: 'consent',
     state,
