@@ -8,6 +8,19 @@
 
 ---
 
+## ⚠️ Open gate: Codex CLI not authenticated (2026-06-17)
+
+`codex exec` exits 401 — device-auth flow requires org admin approval not yet granted.
+API key route also not yet set up.
+
+**Impact:** `/codex-plan-review` (Gate 2) and `/codex-code-review` (Gate 4) cannot run
+until resolved. Proceeding to planning; will resolve before implementation reaches those gates.
+
+**To fix when ready:** `echo "sk-proj-..." | codex login --with-api-key` or
+`codex login --device-auth` once admin approval is granted.
+
+---
+
 ## 1. Base branch: `dev` → `test`
 
 **Skills changed:** `codex-code-review`, `pr-package`, `memory-persist`
