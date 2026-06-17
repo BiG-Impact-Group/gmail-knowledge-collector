@@ -1,0 +1,31 @@
+# Dependencies
+node_modules/
+dist/
+.cache/
+
+# Environment and secrets — NEVER commit these
+.env
+.env.*
+!.env.example
+
+# Claude Code local settings — personal, machine-specific
+.claude/settings.local.json
+
+# Claude memory — local only, never committed
+memory/
+
+# Supabase local artifacts
+supabase/.temp/
+supabase/.branches/
+
+# OS and editor noise
+.DS_Store
+Thumbs.db
+*.swp
+*.swo
+.idea/
+.vscode/settings.json
+
+# Build artifacts
+*.tsbuildinfo
+coverage/

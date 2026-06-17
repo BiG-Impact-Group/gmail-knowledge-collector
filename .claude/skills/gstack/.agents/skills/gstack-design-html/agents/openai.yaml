@@ -1,0 +1,6 @@
+interface:
+  display_name: "gstack-design-html"
+  short_description: "Design finalization: takes an approved AI mockup from /design-shotgun and generates production-quality..."
+  default_prompt: "Use gstack-design-html for this task."
+policy:
+  allow_implicit_invocation: true

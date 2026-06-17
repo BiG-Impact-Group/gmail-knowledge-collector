@@ -1,0 +1,23 @@
+{
+  "skill_name": "jobs-ive-critique",
+  "evals": [
+    {
+      "id": 1,
+      "prompt": "I just built a new empty state for the Products page. When there are no products yet, it shows a big blue folder icon, the text 'No Products Found' in bold, a subtitle 'Create your first product to get started', and a large amber 'Create Product' button. Can you critique this design?",
+      "expected_output": "Steve should identify the generic feel (folder icon, generic copy) and the amber button violating the design system. Jony should provide exact replacements: EmptyState component, specific opacity values, ghosted button styling, and reference the design system's no-amber-buttons rule. The critique should be specific and implementable, not vague.",
+      "files": []
+    },
+    {
+      "id": 2,
+      "prompt": "I'm designing a new settings page for the admin panel. It has a sidebar with icons for each section (General, Users, Billing, Integrations, Security), and the main content area shows forms for the selected section. Each section has a colored header bar (blue for General, green for Users, purple for Billing, etc). The forms use the standard design system inputs. How does this look from a design perspective?",
+      "expected_output": "Steve should question the colored header bars (multiple colors fighting for attention, no narrative coherence) and potentially the icon-heavy sidebar (decorative vs functional). Jony should cite the single-accent-thread rule from TasteComposition, recommend removing colored headers in favor of typography hierarchy, and reference specific design system components (TabbedPage, ResponsiveTabs) as alternatives. Should reference the Scandinavian Minimalism philosophy.",
+      "files": []
+    },
+    {
+      "id": 3,
+      "prompt": "We have the rating engine page and I've been told the table feels 'noisy'. Can you audit src/pages/Rating.tsx and tell me what Steve and Jony would say?",
+      "expected_output": "Should read the actual Rating.tsx file, then critique using the diagnosis framework from TasteComposition ('Feels noisy' → competing visual weights, mixed semantics, inconsistent opacity). Steve identifies the conceptual problem (too many elements competing for attention). Jony provides specific fixes with exact values. Should reference the 3-Second Scan Test and attention hierarchy.",
+      "files": []
+    }
+  ]
+}
