@@ -68,23 +68,32 @@ Deno.serve(async (req: Request) => {
   let statePayload: StatePayload
   try {
     statePayload = await verifyStateJwt(state, stateSecret)
-  } catch {
+  } catch (e) {
+    console.error('State verification failed:', e)
     return new Response('Invalid or expired state. Please try again.', { status: 400 })
   }
 
-  const tokenRes = await fetch(TOKEN_URL, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
-    body: new URLSearchParams({
-      code,
-      client_id: clientId,
-      client_secret: clientSecret,
-      redirect_uri: REDIRECT_URI,
-      grant_type: 'authorization_code',
-    }),
-  })
+  let tokenRes: Response
+  try {
+    tokenRes = await fetch(TOKEN_URL, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+      body: new URLSearchParams({
+        code,
+        client_id: clientId,
+        client_secret: clientSecret,
+        redirect_uri: REDIRECT_URI,
+        grant_type: 'authorization_code',
+      }),
+    })
+  } catch (e) {
+    console.error('Token exchange fetch failed:', e)
+    return new Response('Token exchange network error', { status: 502 })
+  }
 
   if (!tokenRes.ok) {
+    const body = await tokenRes.text()
+    console.error('Token exchange failed:', tokenRes.status, body)
     return new Response('Token exchange failed', { status: 502 })
   }
 
@@ -95,12 +104,19 @@ Deno.serve(async (req: Request) => {
   }
 
   if (!tokens.refresh_token) {
-    return new Response('No refresh token returned. Revoke access in Google and try again.', { status: 400 })
+    console.error('No refresh_token in response. Tokens keys:', Object.keys(tokens))
+    return new Response('No refresh token returned. Revoke access at myaccount.google.com/permissions and try again.', { status: 400 })
   }
 
-  const emailAddress = extractEmailFromIdToken(tokens.id_token)
-  const userId = statePayload.user_id
+  let emailAddress: string
+  try {
+    emailAddress = extractEmailFromIdToken(tokens.id_token)
+  } catch (e) {
+    console.error('Failed to extract email from id_token:', e)
+    return new Response('Failed to read account email', { status: 500 })
+  }
 
+  const userId = statePayload.user_id
   const supabaseAdmin = createClient(supabaseUrl, serviceRoleKey)
 
   const { data: account, error: upsertError } = await supabaseAdmin
@@ -120,26 +136,38 @@ Deno.serve(async (req: Request) => {
     .single()
 
   if (upsertError || !account) {
-    console.error('Upsert error:', upsertError)
+    console.error('Upsert error:', JSON.stringify(upsertError))
     return new Response('Failed to save account', { status: 500 })
   }
 
   // Store refresh token in Vault keyed by account id
-  const existingSecretId = await supabaseAdmin
+  const { data: existingSecretId, error: vaultLookupError } = await supabaseAdmin
     .rpc('get_vault_secret_id', { secret_name: account.id })
-    .then((r) => r.data as string | null)
+
+  if (vaultLookupError) {
+    console.error('Vault lookup error:', JSON.stringify(vaultLookupError))
+    return new Response('Failed to access vault', { status: 500 })
+  }
 
   if (existingSecretId) {
-    await supabaseAdmin.rpc('vault_update_secret', {
+    const { error: updateErr } = await supabaseAdmin.rpc('vault_update_secret', {
       secret_id: existingSecretId,
       new_secret: tokens.refresh_token,
     })
+    if (updateErr) {
+      console.error('Vault update error:', JSON.stringify(updateErr))
+      return new Response('Failed to update vault secret', { status: 500 })
+    }
   } else {
-    await supabaseAdmin.rpc('vault_create_secret', {
+    const { error: createErr } = await supabaseAdmin.rpc('vault_create_secret', {
       secret: tokens.refresh_token,
       name: account.id,
       description: `OAuth refresh token for ${emailAddress}`,
     })
+    if (createErr) {
+      console.error('Vault create error:', JSON.stringify(createErr))
+      return new Response('Failed to store vault secret', { status: 500 })
+    }
   }
 
   // access_token is ephemeral — never stored
