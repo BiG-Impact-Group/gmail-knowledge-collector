@@ -80,7 +80,7 @@ The inherited prompt templates referenced momentum-specific context: insurance S
 
 The inherited skill hardcoded momentum's Supabase project ref (`mcqiltqjmuunhodmafcj`) in the migration target gate (Step 9.5). This causes an immediate hard failure for any other project.
 
-**Replacement:** Updated to this project's Supabase project ref. See Step 9.5 in the skill file.
+**Replacement:** `ybgtzyutbvwfhgtlmnah` (gmail-knowledge-collector project, BiG Impact Group org, us-east-1).
 
 Also updated the runbook path from `docs/superpowers/runbooks/migration-deploy-gate.md` (momentum artifact) to inline the error message — this repo does not have a separate runbooks directory.
 

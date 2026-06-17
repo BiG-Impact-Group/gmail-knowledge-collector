@@ -124,7 +124,7 @@ Report each finding clearly. These don't block the gate but must be documented f
 
 ## Step 9.5 — Migration target check (FAIL-CLOSED)
 
-If Step 9 surfaced any new migration files, verify they would land on the correct Supabase project. **This is a hard gate — failure blocks the PR.**
+If Step 9 surfaced any new migration files, verify they land on the correct Supabase project and run the migration list. **This is a hard gate — failure blocks the PR.**
 
 ```bash
 NEW_MIGRATIONS=$(git diff --name-only $(git merge-base origin/test HEAD)..HEAD -- 'supabase/migrations/*' | wc -l | tr -d ' ')
@@ -134,19 +134,32 @@ if [ "$NEW_MIGRATIONS" -gt 0 ]; then
   echo "=== Linked Supabase project ==="
   echo "$LINKED_REF"
 
-  if [ "$LINKED_REF" != "SUPABASE_PROJECT_REF_PLACEHOLDER" ]; then
+  if [ "$LINKED_REF" != "ybgtzyutbvwfhgtlmnah" ]; then
     echo ""
-    echo "❌ FAIL — linked project ref does not match this project."
-    echo "All migrations must target the gmail-knowledge-collector Supabase project."
-    echo "Run: supabase link --project-ref SUPABASE_PROJECT_REF_PLACEHOLDER"
+    echo "❌ FAIL — linked project ref does not match gmail-knowledge-collector."
+    echo "Run: supabase link --project-ref ybgtzyutbvwfhgtlmnah"
     exit 1
   fi
+
+  # Verify migrations actually applied to the remote DB.
+  # Uses DATABASE_URL from .env (CLI v2 requires DB URL or access token).
+  if [ -z "$DATABASE_URL" ]; then
+    echo "⚠️  DATABASE_URL not set — source your .env before running this gate."
+    echo "   export DATABASE_URL=postgresql://postgres:<password>@db.ybgtzyutbvwfhgtlmnah.supabase.co:6543/postgres"
+    exit 1
+  fi
+  echo ""
+  echo "=== Migration status (Remote) ==="
+  supabase migration list --db-url "$DATABASE_URL"
+  echo ""
+  echo "Every migration in this branch must appear in the Remote column above."
+  echo "If any show Local only, run: supabase db push --db-url \"\$DATABASE_URL\""
 fi
 ```
 
-**Gate:** If new migrations are present, `supabase/.temp/project-ref` MUST match this project's Supabase project ref. See `docs/dev-rules-local-overrides.md` item 4 for the ref value. Re-link if the gate fails: `supabase link --project-ref <ref>`.
+**Gate:** If new migrations are present: (1) `supabase/.temp/project-ref` must be `ybgtzyutbvwfhgtlmnah`; (2) every migration added in this branch must appear in the Remote column of `migration list`. Ensure `DATABASE_URL` is exported before running this gate.
 
-If this gate fails, do NOT proceed to PR. Re-link to the correct project, re-verify, and re-run the gate.
+If this gate fails, do NOT proceed to PR. Apply migrations and re-run the gate.
 
 ## Step 10 — Generate report
 
