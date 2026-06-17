@@ -3,17 +3,11 @@ import { MemoryRouter } from 'react-router-dom'
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query'
 import LoginPage from './LoginPage'
 
-const mockSignIn = jest.fn()
+const mockSignInWithOAuth = jest.fn()
 jest.mock('@/lib/supabase', () => ({
   supabase: {
-    auth: { signInWithPassword: (creds: { email: string; password: string }) => mockSignIn(creds) },
+    auth: { signInWithOAuth: (opts: unknown) => mockSignInWithOAuth(opts) },
   },
-}))
-
-const mockNavigate = jest.fn()
-jest.mock('react-router-dom', () => ({
-  ...jest.requireActual('react-router-dom'),
-  useNavigate: () => mockNavigate,
 }))
 
 function renderLoginPage() {
@@ -32,39 +26,37 @@ beforeEach(() => {
 })
 
 describe('LoginPage', () => {
-  it('renders email and password fields', () => {
+  it('renders the Google sign-in button', () => {
     renderLoginPage()
-    expect(screen.getByLabelText(/email/i)).toBeInTheDocument()
-    expect(screen.getByLabelText(/password/i)).toBeInTheDocument()
+    expect(screen.getByRole('button', { name: /continue with google/i })).toBeInTheDocument()
   })
 
-  it('shows validation error for invalid email on submit', async () => {
+  it('calls signInWithOAuth with google provider on click', async () => {
+    mockSignInWithOAuth.mockResolvedValue({ error: null })
     renderLoginPage()
-    fireEvent.click(screen.getByRole('button', { name: /sign in/i }))
+    fireEvent.click(screen.getByRole('button', { name: /continue with google/i }))
     await waitFor(() => {
-      expect(screen.getByText(/valid email/i)).toBeInTheDocument()
+      expect(mockSignInWithOAuth).toHaveBeenCalledWith(
+        expect.objectContaining({ provider: 'google' }),
+      )
     })
   })
 
-  it('shows server error on auth failure', async () => {
-    mockSignIn.mockResolvedValue({ error: { message: 'Invalid credentials' } })
+  it('shows error message if signInWithOAuth returns an error', async () => {
+    mockSignInWithOAuth.mockResolvedValue({ error: { message: 'OAuth error' } })
     renderLoginPage()
-    fireEvent.change(screen.getByLabelText(/email/i), { target: { value: 'test@test.com' } })
-    fireEvent.change(screen.getByLabelText(/password/i), { target: { value: 'password123' } })
-    fireEvent.click(screen.getByRole('button', { name: /sign in/i }))
+    fireEvent.click(screen.getByRole('button', { name: /continue with google/i }))
     await waitFor(() => {
-      expect(screen.getByText('Invalid credentials')).toBeInTheDocument()
+      expect(screen.getByRole('alert')).toHaveTextContent('OAuth error')
     })
   })
 
-  it('navigates to /accounts on success', async () => {
-    mockSignIn.mockResolvedValue({ error: null })
+  it('disables the button while loading', async () => {
+    mockSignInWithOAuth.mockReturnValue(new Promise(() => {}))
     renderLoginPage()
-    fireEvent.change(screen.getByLabelText(/email/i), { target: { value: 'test@test.com' } })
-    fireEvent.change(screen.getByLabelText(/password/i), { target: { value: 'password123' } })
-    fireEvent.click(screen.getByRole('button', { name: /sign in/i }))
+    fireEvent.click(screen.getByRole('button', { name: /continue with google/i }))
     await waitFor(() => {
-      expect(mockNavigate).toHaveBeenCalledWith('/accounts')
+      expect(screen.getByRole('button', { name: /redirecting/i })).toBeDisabled()
     })
   })
 })
