@@ -1,0 +1,7 @@
+@use '@/styles/tokens' as *;
+
+.list {
+  height: 100%;
+  overflow-y: auto;
+  border-right: 1px solid $color-border;
+}
