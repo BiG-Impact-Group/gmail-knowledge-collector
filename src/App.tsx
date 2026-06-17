@@ -1,15 +1,19 @@
+import { lazy, Suspense, useEffect, useState } from 'react'
 import { Routes, Route, Navigate } from 'react-router-dom'
-import { useEffect, useState } from 'react'
 import { supabase } from '@/lib/supabase'
 import type { Session } from '@supabase/supabase-js'
+import LoginPage from '@/components/auth/LoginPage'
+
+const AccountsPage = lazy(() => import('@/components/accounts/AccountsPage'))
+const EmailPage = lazy(() => import('@/components/email/EmailPage'))
 
 function ProtectedRoute({ children }: { children: React.ReactNode }) {
   const [session, setSession] = useState<Session | null | undefined>(undefined)
 
   useEffect(() => {
     supabase.auth.getSession().then(({ data }) => setSession(data.session))
-    const { data: { subscription } } = supabase.auth.onAuthStateChange((_event, session) => {
-      setSession(session)
+    const { data: { subscription } } = supabase.auth.onAuthStateChange((_event, s) => {
+      setSession(s)
     })
     return () => subscription.unsubscribe()
   }, [])
@@ -21,15 +25,17 @@ function ProtectedRoute({ children }: { children: React.ReactNode }) {
 
 export default function App() {
   return (
-    <Routes>
-      <Route path="/login" element={<div>Login (stub)</div>} />
-      <Route path="/accounts" element={
-        <ProtectedRoute><div>Accounts (stub)</div></ProtectedRoute>
-      } />
-      <Route path="/emails" element={
-        <ProtectedRoute><div>Emails (stub)</div></ProtectedRoute>
-      } />
-      <Route path="/" element={<Navigate to="/accounts" replace />} />
-    </Routes>
+    <Suspense fallback={null}>
+      <Routes>
+        <Route path="/login" element={<LoginPage />} />
+        <Route path="/accounts" element={
+          <ProtectedRoute><AccountsPage /></ProtectedRoute>
+        } />
+        <Route path="/emails" element={
+          <ProtectedRoute><EmailPage /></ProtectedRoute>
+        } />
+        <Route path="/" element={<Navigate to="/accounts" replace />} />
+      </Routes>
+    </Suspense>
   )
 }

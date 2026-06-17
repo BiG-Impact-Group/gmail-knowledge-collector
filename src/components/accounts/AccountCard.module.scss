@@ -1,0 +1,84 @@
+@use '../../styles/tokens' as *;
+
+.card {
+  background: $color-surface;
+  border: 1px solid $color-border;
+  border-radius: $border-radius-md;
+  padding: $spacing-md;
+  display: flex;
+  flex-direction: column;
+  gap: $spacing-sm;
+}
+
+.header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: $spacing-sm;
+}
+
+.info {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+
+.email {
+  font-weight: 500;
+  color: $color-text-primary;
+}
+
+.provider {
+  font-size: $font-size-sm;
+  color: $color-text-secondary;
+}
+
+.status {
+  padding: 2px $spacing-sm;
+  border-radius: $border-radius-sm;
+  font-size: $font-size-sm;
+  font-weight: 500;
+  text-transform: capitalize;
+
+  &.active {
+    background: rgba($color-success, 0.1);
+    color: $color-success;
+  }
+
+  &.error {
+    background: rgba($color-error, 0.1);
+    color: $color-error;
+  }
+
+  &.revoked {
+    background: rgba($color-text-disabled, 0.1);
+    color: $color-text-disabled;
+  }
+}
+
+.footer {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+}
+
+.synced {
+  font-size: $font-size-sm;
+  color: $color-text-secondary;
+}
+
+.reconnect {
+  padding: $spacing-xs $spacing-sm;
+  background: $color-error;
+  color: white;
+  border: none;
+  border-radius: $border-radius-sm;
+  font-size: $font-size-sm;
+  font-weight: 500;
+  cursor: pointer;
+  transition: opacity $transition-fast;
+
+  &:hover {
+    opacity: 0.85;
+  }
+}

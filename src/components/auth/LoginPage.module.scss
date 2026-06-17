@@ -1,0 +1,98 @@
+@use '../../styles/tokens' as *;
+
+.page {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  min-height: 100vh;
+  background: $color-surface-alt;
+  padding: $spacing-md;
+}
+
+.card {
+  background: $color-surface;
+  border: 1px solid $color-border;
+  border-radius: $border-radius-lg;
+  box-shadow: $shadow-md;
+  padding: $spacing-2xl;
+  width: 100%;
+  max-width: 400px;
+}
+
+.title {
+  font-size: $font-size-xl;
+  font-weight: 600;
+  color: $color-text-primary;
+  margin: 0 0 $spacing-xs;
+}
+
+.subtitle {
+  color: $color-text-secondary;
+  margin: 0 0 $spacing-xl;
+}
+
+.form {
+  display: flex;
+  flex-direction: column;
+  gap: $spacing-md;
+}
+
+.field {
+  display: flex;
+  flex-direction: column;
+  gap: $spacing-xs;
+
+  label {
+    font-size: $font-size-base;
+    font-weight: 500;
+    color: $color-text-primary;
+  }
+
+  input {
+    padding: $spacing-sm $spacing-md;
+    border: 1px solid $color-border;
+    border-radius: $border-radius-sm;
+    font-size: $font-size-base;
+    color: $color-text-primary;
+    transition: border-color $transition-fast;
+
+    &:focus {
+      outline: none;
+      border-color: $color-primary;
+    }
+  }
+}
+
+.fieldError {
+  font-size: $font-size-sm;
+  color: $color-error;
+}
+
+.serverError {
+  padding: $spacing-sm $spacing-md;
+  background: rgba($color-error, 0.08);
+  border: 1px solid rgba($color-error, 0.2);
+  border-radius: $border-radius-sm;
+  color: $color-error;
+  font-size: $font-size-base;
+}
+
+.submit {
+  padding: $spacing-sm $spacing-md;
+  background: $color-primary;
+  color: white;
+  border: none;
+  border-radius: $border-radius-sm;
+  font-size: $font-size-base;
+  font-weight: 500;
+  transition: background $transition-fast;
+
+  &:hover:not(:disabled) {
+    background: $color-primary-dark;
+  }
+
+  &:disabled {
+    opacity: 0.6;
+    cursor: not-allowed;
+  }
+}
