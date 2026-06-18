@@ -7,8 +7,17 @@ interface Props {
 }
 
 function wrapWithCsp(html: string): string {
-  const csp = `<meta http-equiv="Content-Security-Policy" content="default-src 'none'; style-src 'unsafe-inline';">`
-  return `<!DOCTYPE html><html><head>${csp}</head><body>${html}</body></html>`
+  const csp = [
+    "default-src 'none'",
+    "style-src 'unsafe-inline'",
+    "base-uri 'none'",
+    "form-action 'none'",
+    "img-src 'none'",
+    "media-src 'none'",
+    "frame-src 'none'",
+    "connect-src 'none'",
+  ].join('; ')
+  return `<!DOCTYPE html><html><head><meta http-equiv="Content-Security-Policy" content="${csp}"></head><body>${html}</body></html>`
 }
 
 function formatFullDate(dateStr: string | null): string {

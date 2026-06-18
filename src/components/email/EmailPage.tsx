@@ -1,4 +1,4 @@
-import { useState } from 'react'
+import { useMemo, useState } from 'react'
 import { useNavigate } from 'react-router-dom'
 import { useAccounts } from '@/hooks/useAccounts'
 import { useMessages } from '@/hooks/useMessages'
@@ -12,10 +12,30 @@ export default function EmailPage() {
   const navigate = useNavigate()
   const [selectedId, setSelectedId] = useState<string | null>(null)
   const [showDetail, setShowDetail] = useState(false)
+  const [accountFilter, setAccountFilter] = useState<string | undefined>()
 
   const { data: accounts, isLoading: accountsLoading } = useAccounts()
-  const { data: messages, isLoading: messagesLoading } = useMessages()
+  const {
+    data: messagesData,
+    isLoading: messagesLoading,
+    fetchNextPage,
+    hasNextPage,
+    isFetchingNextPage,
+  } = useMessages(accountFilter)
   const { data: selectedMessage, isLoading: messageLoading } = useMessage(selectedId)
+
+  const messages = messagesData?.pages.flat() ?? []
+
+  const accountMap = useMemo(() => {
+    if (!accounts) return new Map<string, string>()
+    return new Map(accounts.map(a => [a.id, a.email_address]))
+  }, [accounts])
+
+  const handleFilterChange = (id: string | undefined) => {
+    setAccountFilter(id)
+    setSelectedId(null)
+    setShowDetail(false)
+  }
 
   const handleSelect = (id: string) => {
     setSelectedId(id)
@@ -23,8 +43,8 @@ export default function EmailPage() {
   }
 
   const noAccounts = !accountsLoading && accounts && accounts.length === 0
-  const hasMessages = messages && messages.length > 0
-  const noMessages = !messagesLoading && accounts && accounts.length > 0 && messages && messages.length === 0
+  const hasMessages = messages.length > 0
+  const noMessages = !messagesLoading && accounts && accounts.length > 0 && messages.length === 0
 
   return (
     <div className={styles.page}>
@@ -33,6 +53,22 @@ export default function EmailPage() {
           ← Accounts
         </button>
         <h1 className={styles.title}>Emails</h1>
+        {accounts && accounts.length > 1 && (
+          <div className={styles.filterGroup}>
+            <label className={styles.filterLabel} htmlFor="account-filter">Account</label>
+            <select
+              id="account-filter"
+              className={styles.filter}
+              value={accountFilter ?? ''}
+              onChange={e => handleFilterChange(e.target.value || undefined)}
+            >
+              <option value="">All accounts</option>
+              {accounts.map(a => (
+                <option key={a.id} value={a.id}>{a.email_address}</option>
+              ))}
+            </select>
+          </div>
+        )}
       </header>
 
       <div className={styles.layout}>
@@ -54,7 +90,17 @@ export default function EmailPage() {
               messages={messages}
               selectedId={selectedId}
               onSelect={handleSelect}
+              accountMap={accountMap}
             />
+          )}
+          {hasMessages && hasNextPage && (
+            <button
+              className={styles.loadMore}
+              onClick={() => fetchNextPage()}
+              disabled={isFetchingNextPage}
+            >
+              {isFetchingNextPage ? 'Loading…' : 'Load more'}
+            </button>
           )}
         </div>
 

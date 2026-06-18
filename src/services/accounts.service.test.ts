@@ -34,7 +34,7 @@ describe('accounts.service', () => {
   it('queries connected_accounts ordered by created_at desc', async () => {
     await getAccounts()
     expect(mockFrom).toHaveBeenCalledWith('connected_accounts')
-    expect(mockSelect).toHaveBeenCalledWith('*')
+    expect(mockSelect).toHaveBeenCalledWith('id, provider, email_address, status, granted_scopes, last_synced_at, created_at, updated_at')
     expect(mockOrder).toHaveBeenCalledWith('created_at', { ascending: false })
   })
 })

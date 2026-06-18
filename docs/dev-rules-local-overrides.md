@@ -55,16 +55,19 @@ codex exec -m o3 -s read-only \
   < /tmp/prompt.md
 ```
 
-**Model used:** `o3` (confirmed working via smoke test on 2026-06-17)
+**Model used:** `gpt-5.5` (confirmed working on 2026-06-18 — default model for this ChatGPT account)
+
+**NOTE (2026-06-18):** `o3`, `o4-mini`, and `gpt-4o` all fail with "model not supported when using Codex with a ChatGPT account." Omit `-m` flag entirely to use the configured default (`gpt-5.5` per `~/.codex/config.toml`).
 
 **Sandbox:** `-s read-only` — Codex can read files but cannot execute shell commands or edit code. Reviews are audit-only; Claude applies fixes.
 
-**Fallback if `-o` is unavailable:**
+**Updated invocation:**
 ```bash
-cat /tmp/prompt.md | codex exec -m o3 -s read-only - 2>&1 | tee /tmp/output.md
+codex exec -s read-only \
+  "<short instruction>" \
+  -o /tmp/output.md \
+  < /tmp/prompt.md
 ```
-
-If `o3` is rejected at runtime, try `o4-mini` or `gpt-4o` and update this file with the working model.
 
 ---
 
