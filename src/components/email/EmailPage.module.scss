@@ -32,8 +32,20 @@
   margin: 0;
 }
 
-.filter {
+.filterGroup {
+  display: flex;
+  align-items: center;
+  gap: $spacing-xs;
   margin-left: auto;
+}
+
+.filterLabel {
+  font-size: $font-size-sm;
+  color: $color-text-secondary;
+  white-space: nowrap;
+}
+
+.filter {
   padding: $spacing-xs $spacing-sm;
   border: 1px solid $color-border;
   border-radius: 4px;

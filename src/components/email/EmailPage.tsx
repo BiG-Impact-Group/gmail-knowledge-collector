@@ -54,16 +54,20 @@ export default function EmailPage() {
         </button>
         <h1 className={styles.title}>Emails</h1>
         {accounts && accounts.length > 1 && (
-          <select
-            className={styles.filter}
-            value={accountFilter ?? ''}
-            onChange={e => handleFilterChange(e.target.value || undefined)}
-          >
-            <option value="">All accounts</option>
-            {accounts.map(a => (
-              <option key={a.id} value={a.id}>{a.email_address}</option>
-            ))}
-          </select>
+          <div className={styles.filterGroup}>
+            <label className={styles.filterLabel} htmlFor="account-filter">Account</label>
+            <select
+              id="account-filter"
+              className={styles.filter}
+              value={accountFilter ?? ''}
+              onChange={e => handleFilterChange(e.target.value || undefined)}
+            >
+              <option value="">All accounts</option>
+              {accounts.map(a => (
+                <option key={a.id} value={a.id}>{a.email_address}</option>
+              ))}
+            </select>
+          </div>
         )}
       </header>
 

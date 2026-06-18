@@ -29,6 +29,17 @@ function extractSenderName(from: string | null): string {
   return match ? match[1].trim() : from
 }
 
+function decodeEntities(str: string | null): string {
+  if (!str) return ''
+  return str
+    .replace(/&amp;/g, '&')
+    .replace(/&lt;/g, '<')
+    .replace(/&gt;/g, '>')
+    .replace(/&quot;/g, '"')
+    .replace(/&#39;/g, "'")
+    .replace(/&#(\d+);/g, (_, n) => String.fromCharCode(Number(n)))
+}
+
 export default function MessageItem({ message, accountEmail, isSelected, onClick }: Props) {
   return (
     <button
@@ -41,7 +52,7 @@ export default function MessageItem({ message, accountEmail, isSelected, onClick
         <div className={styles.account}>{accountEmail}</div>
       )}
       <div className={styles.subject}>{message.subject || '(no subject)'}</div>
-      <div className={styles.snippet}>{message.snippet}</div>
+      <div className={styles.snippet}>{decodeEntities(message.snippet)}</div>
     </button>
   )
 }
