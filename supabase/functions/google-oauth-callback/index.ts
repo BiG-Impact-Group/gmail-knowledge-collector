@@ -83,6 +83,8 @@ Deno.serve(async (req: Request) => {
     return new Response('Invalid or expired state. Please try again.', { status: 400 })
   }
 
+  const supabaseAdmin = createClient(supabaseUrl, serviceRoleKey)
+
   // Consume nonce atomically — a second request with the same state is rejected
   const { data: consumed, error: nonceErr } = await supabaseAdmin
     .from('oauth_nonces')
@@ -139,7 +141,6 @@ Deno.serve(async (req: Request) => {
   }
 
   const userId = statePayload.user_id
-  const supabaseAdmin = createClient(supabaseUrl, serviceRoleKey)
 
   // Save account as 'error' first; update to 'active' only after vault write succeeds
   const { data: account, error: upsertError } = await supabaseAdmin
