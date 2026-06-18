@@ -1,3 +1,11 @@
+// CONNECTOR SEAM: This function initiates the OAuth flow for Google.
+// A second connector (e.g. Microsoft, Slack) would:
+//   1. Define its own AUTH_URL, SCOPES, and REDIRECT_URI
+//   2. Implement its own state signing or PKCE mechanism
+//   3. Deploy as a separate edge function (e.g. microsoft-oauth-initiate)
+// The browser calls accounts.service.ts → initiateOAuth(provider) which routes to the correct function.
+// See src/types/connector.ts for the ConnectorConfig interface shape.
+
 import { createClient } from 'https://esm.sh/@supabase/supabase-js@2'
 
 const GOOGLE_AUTH_URL = 'https://accounts.google.com/o/oauth2/v2/auth'
@@ -13,11 +21,11 @@ function base64url(data: ArrayBuffer): string {
     .replace(/\+/g, '-').replace(/\//g, '_').replace(/=/g, '')
 }
 
-async function buildStateJwt(userId: string, stateSecret: string): Promise<string> {
+async function buildStateJwt(userId: string, stateSecret: string, nonce: string): Promise<string> {
   const header = base64url(new TextEncoder().encode(JSON.stringify({ alg: 'HS256', typ: 'JWT' })))
   const payload = base64url(new TextEncoder().encode(JSON.stringify({
     user_id: userId,
-    nonce: crypto.randomUUID(),
+    nonce,
     exp: Math.floor(Date.now() / 1000) + 300,
   })))
   const signingInput = `${header}.${payload}`
@@ -45,6 +53,7 @@ Deno.serve(async (req: Request) => {
 
   const supabaseUrl = Deno.env.get('SUPABASE_URL')!
   const supabaseAnonKey = Deno.env.get('SUPABASE_ANON_KEY')!
+  const serviceRoleKey = Deno.env.get('SUPABASE_SERVICE_ROLE_KEY')!
   const stateSecret = Deno.env.get('STATE_SECRET')!
   const clientId = Deno.env.get('GOOGLE_CLIENT_ID')!
 
@@ -62,7 +71,19 @@ Deno.serve(async (req: Request) => {
     return Response.json({ error: 'Unauthorized' }, { status: 401, headers: corsHeaders })
   }
 
-  const state = await buildStateJwt(user.id, stateSecret)
+  const nonce = crypto.randomUUID()
+  const state = await buildStateJwt(user.id, stateSecret, nonce)
+
+  // Store nonce server-side so the callback can consume it exactly once (replay protection)
+  const supabaseAdmin = createClient(supabaseUrl, serviceRoleKey)
+  const expiresAt = new Date(Date.now() + 5 * 60 * 1000).toISOString()
+  const { error: nonceErr } = await supabaseAdmin
+    .from('oauth_nonces')
+    .insert({ nonce, user_id: user.id, expires_at: expiresAt })
+  if (nonceErr) {
+    console.error('Failed to store OAuth nonce:', nonceErr.message)
+    return Response.json({ error: 'Internal error' }, { status: 500, headers: corsHeaders })
+  }
 
   const params = new URLSearchParams({
     client_id: clientId,

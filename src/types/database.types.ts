@@ -16,6 +16,9 @@ export type Database = {
     Tables: {
       connected_accounts: {
         Row: {
+          backfill_complete: boolean
+          backfill_page_token: string | null
+          backfill_start_history_id: string | null
           created_at: string
           email_address: string
           granted_scopes: string | null
@@ -28,6 +31,9 @@ export type Database = {
           user_id: string
         }
         Insert: {
+          backfill_complete?: boolean
+          backfill_page_token?: string | null
+          backfill_start_history_id?: string | null
           created_at?: string
           email_address: string
           granted_scopes?: string | null
@@ -40,6 +46,9 @@ export type Database = {
           user_id: string
         }
         Update: {
+          backfill_complete?: boolean
+          backfill_page_token?: string | null
+          backfill_start_history_id?: string | null
           created_at?: string
           email_address?: string
           granted_scopes?: string | null

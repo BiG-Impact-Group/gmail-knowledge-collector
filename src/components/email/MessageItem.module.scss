@@ -47,6 +47,16 @@
   text-overflow: ellipsis;
 }
 
+.account {
+  grid-column: 1 / -1;
+  font-size: $font-size-sm;
+  color: $color-primary;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  opacity: 0.75;
+}
+
 .snippet {
   grid-column: 1 / -1;
   font-size: $font-size-sm;

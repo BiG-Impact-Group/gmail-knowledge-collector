@@ -32,6 +32,29 @@
   margin: 0;
 }
 
+.filterGroup {
+  display: flex;
+  align-items: center;
+  gap: $spacing-xs;
+  margin-left: auto;
+}
+
+.filterLabel {
+  font-size: $font-size-sm;
+  color: $color-text-secondary;
+  white-space: nowrap;
+}
+
+.filter {
+  padding: $spacing-xs $spacing-sm;
+  border: 1px solid $color-border;
+  border-radius: 4px;
+  background: $color-surface;
+  font-size: $font-size-sm;
+  color: $color-text-primary;
+  cursor: pointer;
+}
+
 .layout {
   display: grid;
   grid-template-columns: 35% 65%;
@@ -68,6 +91,27 @@
   padding: $spacing-xl;
   color: $color-text-secondary;
   text-align: center;
+}
+
+.loadMore {
+  flex-shrink: 0;
+  width: 100%;
+  padding: $spacing-sm;
+  background: $color-surface-alt;
+  border: none;
+  border-top: 1px solid $color-border;
+  color: $color-primary;
+  font-size: $font-size-sm;
+  cursor: pointer;
+
+  &:hover:not(:disabled) {
+    background: $color-border;
+  }
+
+  &:disabled {
+    color: $color-text-secondary;
+    cursor: not-allowed;
+  }
 }
 
 @media (width <= 640px) {

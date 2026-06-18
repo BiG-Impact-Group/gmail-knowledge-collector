@@ -1,12 +1,15 @@
+// CONNECTOR SEAM: This function handles the OAuth callback for Google.
+// A second connector would implement its own callback with provider-specific token exchange.
+// The callback URL must be registered with the provider's OAuth client configuration.
+// Key invariants that ALL connectors must honour:
+//   - Store refresh tokens in Supabase Vault only (never return to browser)
+//   - Mark connected_account status 'error' before vault write, 'active' only on success
+//   - Never log token values — log only error codes
+
 import { createClient } from 'https://esm.sh/@supabase/supabase-js@2'
 
 const REDIRECT_URI = 'https://ybgtzyutbvwfhgtlmnah.supabase.co/functions/v1/google-oauth-callback'
 const TOKEN_URL = 'https://oauth2.googleapis.com/token'
-
-function base64url(data: ArrayBuffer): string {
-  return btoa(String.fromCharCode(...new Uint8Array(data)))
-    .replace(/\+/g, '-').replace(/\//g, '_').replace(/=/g, '')
-}
 
 function base64urlDecode(str: string): string {
   const base64 = str.replace(/-/g, '+').replace(/_/g, '/')
@@ -44,9 +47,15 @@ async function verifyStateJwt(token: string, secret: string): Promise<StatePaylo
   return data
 }
 
-function extractEmailFromIdToken(idToken: string): string {
-  const payload = JSON.parse(base64urlDecode(idToken.split('.')[1]))
-  return payload.email as string
+async function fetchEmailFromUserinfo(accessToken: string): Promise<string> {
+  const res = await fetch('https://www.googleapis.com/oauth2/v3/userinfo', {
+    headers: { Authorization: `Bearer ${accessToken}` },
+  })
+  if (!res.ok) throw new Error(`Userinfo failed: ${res.status}`)
+  const data = await res.json() as { email?: string; email_verified?: boolean }
+  if (!data.email_verified) throw new Error('Email not verified')
+  if (!data.email) throw new Error('No email in userinfo')
+  return data.email
 }
 
 Deno.serve(async (req: Request) => {
@@ -71,6 +80,21 @@ Deno.serve(async (req: Request) => {
     statePayload = await verifyStateJwt(state, stateSecret)
   } catch (e) {
     console.error('State verification failed:', e)
+    return new Response('Invalid or expired state. Please try again.', { status: 400 })
+  }
+
+  const supabaseAdmin = createClient(supabaseUrl, serviceRoleKey)
+
+  // Consume nonce atomically — a second request with the same state is rejected
+  const { data: consumed, error: nonceErr } = await supabaseAdmin
+    .from('oauth_nonces')
+    .delete()
+    .eq('nonce', statePayload.nonce)
+    .eq('user_id', statePayload.user_id)
+    .gt('expires_at', new Date().toISOString())
+    .select('nonce')
+  if (nonceErr || !consumed?.length) {
+    console.error('Nonce validation failed (already used, expired, or not found)')
     return new Response('Invalid or expired state. Please try again.', { status: 400 })
   }
 
@@ -101,7 +125,6 @@ Deno.serve(async (req: Request) => {
   const tokens = await tokenRes.json() as {
     refresh_token?: string
     access_token: string
-    id_token: string
   }
 
   if (!tokens.refresh_token) {
@@ -111,14 +134,13 @@ Deno.serve(async (req: Request) => {
 
   let emailAddress: string
   try {
-    emailAddress = extractEmailFromIdToken(tokens.id_token)
+    emailAddress = await fetchEmailFromUserinfo(tokens.access_token)
   } catch (e) {
-    console.error('Failed to extract email from id_token:', e)
+    console.error('Failed to fetch email from userinfo:', e)
     return new Response('Failed to read account email', { status: 500 })
   }
 
   const userId = statePayload.user_id
-  const supabaseAdmin = createClient(supabaseUrl, serviceRoleKey)
 
   // Save account as 'error' first; update to 'active' only after vault write succeeds
   const { data: account, error: upsertError } = await supabaseAdmin
