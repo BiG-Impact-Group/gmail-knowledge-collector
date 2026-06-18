@@ -193,10 +193,7 @@ Deno.serve(async (req: Request) => {
           if (!profileRes.ok) { errors++; continue }
           const profile = await profileRes.json() as { historyId?: string }
           startHistoryId = profile.historyId ?? null
-          await supabaseAdmin
-            .from('connected_accounts')
-            .update({ backfill_start_history_id: startHistoryId, updated_at: new Date().toISOString() })
-            .eq('id', account.id)
+          // Do not persist here — we'll persist atomically with the first page token update below
         }
 
         // 12-month date cutoff: YYYY/MM/DD format for Gmail q= filter
@@ -217,7 +214,7 @@ Deno.serve(async (req: Request) => {
         }
         messageIds = (listData.messages ?? []).map(m => m.id)
 
-        // Process messages for this page (see loop below)
+        // Process messages for this page
         for (const msgId of messageIds) {
           try {
             const msg = await fetchFullMessage(accessToken, msgId)
@@ -248,26 +245,31 @@ Deno.serve(async (req: Request) => {
         if (isBackfillComplete(listData.nextPageToken)) {
           // Final page — backfill done. Set sync_cursor to the historyId captured
           // before page 1 so the History API covers the entire backfill window.
-          await supabaseAdmin
+          const { error: updateErr } = await supabaseAdmin
             .from('connected_accounts')
             .update({
               backfill_complete: true,
               backfill_page_token: null,
+              backfill_start_history_id: startHistoryId,
               sync_cursor: startHistoryId,
               last_synced_at: new Date().toISOString(),
               updated_at: new Date().toISOString(),
             })
             .eq('id', account.id)
+          if (updateErr) { errors++; continue }
         } else {
-          // More pages — save page token for next cron run
-          await supabaseAdmin
+          // More pages — persist backfill_start_history_id atomically with page token
+          // so the next run sees a consistent (startHistoryId, pageToken) pair.
+          const { error: updateErr } = await supabaseAdmin
             .from('connected_accounts')
             .update({
+              backfill_start_history_id: startHistoryId,
               backfill_page_token: listData.nextPageToken,
               last_synced_at: new Date().toISOString(),
               updated_at: new Date().toISOString(),
             })
             .eq('id', account.id)
+          if (updateErr) { errors++; continue }
         }
 
       } else {
