@@ -6,6 +6,11 @@ interface Props {
   isLoading: boolean
 }
 
+function wrapWithCsp(html: string): string {
+  const csp = `<meta http-equiv="Content-Security-Policy" content="default-src 'none'; style-src 'unsafe-inline';">`
+  return `<!DOCTYPE html><html><head>${csp}</head><body>${html}</body></html>`
+}
+
 function formatFullDate(dateStr: string | null): string {
   if (!dateStr) return ''
   return new Date(dateStr).toLocaleString([], {
@@ -40,8 +45,8 @@ export default function MessageDetail({ message, isLoading }: Props) {
       <div className={styles.body}>
         {message.body_html ? (
           <iframe
-            srcDoc={message.body_html}
-            sandbox="allow-same-origin"
+            srcDoc={wrapWithCsp(message.body_html)}
+            sandbox=""
             className={styles.iframe}
             title={message.subject ?? 'Email content'}
           />

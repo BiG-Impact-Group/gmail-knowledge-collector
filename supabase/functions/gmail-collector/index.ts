@@ -26,7 +26,8 @@ interface GmailPart {
 function base64urlDecode(str: string): string {
   const base64 = str.replace(/-/g, '+').replace(/_/g, '/')
   const padded = base64 + '='.repeat((4 - base64.length % 4) % 4)
-  return atob(padded)
+  const bytes = Uint8Array.from(atob(padded), c => c.charCodeAt(0))
+  return new TextDecoder('utf-8').decode(bytes)
 }
 
 function extractBody(payload: GmailMessage['payload']): { text: string | null; html: string | null } {
@@ -157,18 +158,33 @@ Deno.serve(async (req: Request) => {
           { headers: { Authorization: `Bearer ${accessToken}` } },
         )
         if (!res.ok) { errors++; continue }
-        const data = await res.json() as {
-          messages?: Array<{ id: string }>
-          historyId?: string
-        }
+        const data = await res.json() as { messages?: Array<{ id: string }> }
         messageIds = (data.messages ?? []).map(m => m.id)
-        newCursor = data.historyId ?? null
+        // messages.list has no historyId — fetch it from profile
+        const profileRes = await fetch(
+          `${GMAIL_API}/users/me/profile`,
+          { headers: { Authorization: `Bearer ${accessToken}` } },
+        )
+        if (profileRes.ok) {
+          const profile = await profileRes.json() as { historyId?: string }
+          newCursor = profile.historyId ?? null
+        }
       } else {
         const res = await fetch(
           `${GMAIL_API}/users/me/history?startHistoryId=${account.sync_cursor}&historyTypes=messageAdded`,
           { headers: { Authorization: `Bearer ${accessToken}` } },
         )
-        if (!res.ok) { errors++; continue }
+        if (!res.ok) {
+          if (res.status === 404) {
+            // Cursor too old — reset so next run does a full resync
+            await supabaseAdmin
+              .from('connected_accounts')
+              .update({ sync_cursor: null, updated_at: new Date().toISOString() })
+              .eq('id', account.id)
+          }
+          errors++
+          continue
+        }
         const data = await res.json() as {
           history?: Array<{ messagesAdded?: Array<{ message: { id: string } }> }>
           historyId?: string

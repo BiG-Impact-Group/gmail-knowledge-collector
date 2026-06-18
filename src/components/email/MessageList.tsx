@@ -1,9 +1,9 @@
-import type { Message } from '@/services/messages.service'
+import type { MessageListItem } from '@/services/messages.service'
 import MessageItem from './MessageItem'
 import styles from './MessageList.module.scss'
 
 interface Props {
-  messages: Message[]
+  messages: MessageListItem[]
   selectedId: string | null
   onSelect: (id: string) => void
 }

@@ -11,7 +11,8 @@ function base64url(data: ArrayBuffer): string {
 function base64urlDecode(str: string): string {
   const base64 = str.replace(/-/g, '+').replace(/_/g, '/')
   const padded = base64 + '='.repeat((4 - (base64.length % 4)) % 4)
-  return atob(padded)
+  const bytes = Uint8Array.from(atob(padded), c => c.charCodeAt(0))
+  return new TextDecoder('utf-8').decode(bytes)
 }
 
 interface StatePayload {
@@ -92,8 +93,8 @@ Deno.serve(async (req: Request) => {
   }
 
   if (!tokenRes.ok) {
-    const body = await tokenRes.text()
-    console.error('Token exchange failed:', tokenRes.status, body)
+    const err = await tokenRes.json().catch(() => ({})) as { error?: string }
+    console.error('Token exchange failed', { status: tokenRes.status, error: err.error })
     return new Response('Token exchange failed', { status: 502 })
   }
 
@@ -119,14 +120,15 @@ Deno.serve(async (req: Request) => {
   const userId = statePayload.user_id
   const supabaseAdmin = createClient(supabaseUrl, serviceRoleKey)
 
+  // Save account as 'error' first; update to 'active' only after vault write succeeds
   const { data: account, error: upsertError } = await supabaseAdmin
     .from('connected_accounts')
     .upsert({
       user_id: userId,
       provider: 'google',
       email_address: emailAddress,
-      status: 'active',
-      granted_scopes: 'https://www.googleapis.com/auth/gmail.readonly',
+      status: 'error',
+      granted_scopes: 'openid email https://www.googleapis.com/auth/gmail.readonly',
       updated_at: new Date().toISOString(),
     }, {
       onConflict: 'user_id,email_address',
@@ -169,6 +171,12 @@ Deno.serve(async (req: Request) => {
       return new Response('Failed to store vault secret', { status: 500 })
     }
   }
+
+  // Vault write succeeded — mark account active
+  await supabaseAdmin
+    .from('connected_accounts')
+    .update({ status: 'active', updated_at: new Date().toISOString() })
+    .eq('id', account.id)
 
   // access_token is ephemeral — never stored
   return Response.redirect(`${siteUrl}/accounts`, 302)

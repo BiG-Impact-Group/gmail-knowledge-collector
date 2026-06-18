@@ -1,8 +1,8 @@
-import type { Message } from '@/services/messages.service'
+import type { MessageListItem } from '@/services/messages.service'
 import styles from './MessageItem.module.scss'
 
 interface Props {
-  message: Message
+  message: MessageListItem
   isSelected: boolean
   onClick: () => void
 }

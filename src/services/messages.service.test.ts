@@ -1,6 +1,7 @@
 import { getMessages, getMessage } from './messages.service'
 
-const mockOrder = jest.fn()
+const mockRange = jest.fn()
+const mockOrder = jest.fn(() => ({ range: mockRange }))
 const mockSingle = jest.fn()
 const mockEq = jest.fn(() => ({ single: mockSingle }))
 
@@ -20,13 +21,13 @@ describe('messages.service', () => {
 
   describe('getMessages', () => {
     it('returns empty array when no messages', async () => {
-      mockOrder.mockResolvedValue({ data: [], error: null })
+      mockRange.mockResolvedValue({ data: [], error: null })
       const result = await getMessages()
       expect(result).toEqual([])
     })
 
     it('throws when supabase returns error', async () => {
-      mockOrder.mockResolvedValue({ data: null, error: new Error('DB error') })
+      mockRange.mockResolvedValue({ data: null, error: new Error('DB error') })
       await expect(getMessages()).rejects.toThrow('DB error')
     })
   })
