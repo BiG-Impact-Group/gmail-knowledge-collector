@@ -1,3 +1,11 @@
+// CONNECTOR SEAM: This function initiates the OAuth flow for Google.
+// A second connector (e.g. Microsoft, Slack) would:
+//   1. Define its own AUTH_URL, SCOPES, and REDIRECT_URI
+//   2. Implement its own state signing or PKCE mechanism
+//   3. Deploy as a separate edge function (e.g. microsoft-oauth-initiate)
+// The browser calls accounts.service.ts → initiateOAuth(provider) which routes to the correct function.
+// See src/types/connector.ts for the ConnectorConfig interface shape.
+
 import { createClient } from 'https://esm.sh/@supabase/supabase-js@2'
 
 const GOOGLE_AUTH_URL = 'https://accounts.google.com/o/oauth2/v2/auth'

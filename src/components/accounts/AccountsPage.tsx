@@ -1,6 +1,6 @@
 import { useNavigate } from 'react-router-dom'
 import { useAccounts } from '@/hooks/useAccounts'
-import { initiateGoogleOAuth } from '@/services/accounts.service'
+import { initiateOAuth } from '@/services/accounts.service'
 import AccountCard from './AccountCard'
 import EmptyState from '@/components/shared/EmptyState'
 import styles from './AccountsPage.module.scss'
@@ -20,7 +20,7 @@ export default function AccountsPage() {
       <header className={styles.header}>
         <h1 className={styles.title}>Connected Accounts</h1>
         <div className={styles.headerActions}>
-          <button className={styles.connectBtn} onClick={initiateGoogleOAuth}>
+          <button className={styles.connectBtn} onClick={() => initiateOAuth('google')}>
             Connect Gmail
           </button>
           <button className={styles.signOutBtn} onClick={handleSignOut}>
@@ -35,7 +35,7 @@ export default function AccountsPage() {
         {accounts && accounts.length === 0 && (
           <EmptyState
             message="No accounts connected yet."
-            action={{ label: 'Connect Gmail', onClick: initiateGoogleOAuth }}
+            action={{ label: 'Connect Gmail', onClick: () => initiateOAuth('google') }}
           />
         )}
         {accounts && accounts.length > 0 && (

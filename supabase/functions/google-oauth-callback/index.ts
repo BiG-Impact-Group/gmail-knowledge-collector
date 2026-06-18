@@ -1,3 +1,11 @@
+// CONNECTOR SEAM: This function handles the OAuth callback for Google.
+// A second connector would implement its own callback with provider-specific token exchange.
+// The callback URL must be registered with the provider's OAuth client configuration.
+// Key invariants that ALL connectors must honour:
+//   - Store refresh tokens in Supabase Vault only (never return to browser)
+//   - Mark connected_account status 'error' before vault write, 'active' only on success
+//   - Never log token values — log only error codes
+
 import { createClient } from 'https://esm.sh/@supabase/supabase-js@2'
 
 const REDIRECT_URI = 'https://ybgtzyutbvwfhgtlmnah.supabase.co/functions/v1/google-oauth-callback'

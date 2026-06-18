@@ -1,6 +1,6 @@
 import styles from './AccountCard.module.scss'
 import type { ConnectedAccount } from '@/services/accounts.service'
-import { initiateGoogleOAuth } from '@/services/accounts.service'
+import { initiateOAuth } from '@/services/accounts.service'
 
 interface Props {
   account: ConnectedAccount
@@ -37,7 +37,7 @@ export default function AccountCard({ account }: Props) {
           Last synced: {formatRelativeTime(account.last_synced_at)}
         </span>
         {account.status === 'error' && (
-          <button className={styles.reconnect} onClick={initiateGoogleOAuth}>
+          <button className={styles.reconnect} onClick={() => initiateOAuth('google')}>
             Reconnect
           </button>
         )}

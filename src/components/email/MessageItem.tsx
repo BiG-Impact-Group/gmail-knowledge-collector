@@ -3,6 +3,7 @@ import styles from './MessageItem.module.scss'
 
 interface Props {
   message: MessageListItem
+  accountEmail?: string
   isSelected: boolean
   onClick: () => void
 }
@@ -28,7 +29,7 @@ function extractSenderName(from: string | null): string {
   return match ? match[1].trim() : from
 }
 
-export default function MessageItem({ message, isSelected, onClick }: Props) {
+export default function MessageItem({ message, accountEmail, isSelected, onClick }: Props) {
   return (
     <button
       className={`${styles.item} ${isSelected ? styles.selected : ''}`}
@@ -36,6 +37,9 @@ export default function MessageItem({ message, isSelected, onClick }: Props) {
     >
       <div className={styles.sender}>{extractSenderName(message.from_address)}</div>
       <div className={styles.date}>{formatDate(message.internal_date)}</div>
+      {accountEmail && (
+        <div className={styles.account}>{accountEmail}</div>
+      )}
       <div className={styles.subject}>{message.subject || '(no subject)'}</div>
       <div className={styles.snippet}>{message.snippet}</div>
     </button>

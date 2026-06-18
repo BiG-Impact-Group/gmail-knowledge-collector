@@ -38,6 +38,7 @@ export default [
         clearTimeout: 'readonly',
         Promise: 'readonly',
         URL: 'readonly',
+        URLSearchParams: 'readonly',
       },
     },
     plugins: {
