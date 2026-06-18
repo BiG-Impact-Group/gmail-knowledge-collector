@@ -1,0 +1,93 @@
+@use '@/styles/tokens' as *;
+
+.page {
+  display: flex;
+  flex-direction: column;
+  height: 100vh;
+  overflow: hidden;
+}
+
+.header {
+  display: flex;
+  align-items: center;
+  gap: $spacing-md;
+  padding: $spacing-sm $spacing-md;
+  background: $color-surface;
+  border-bottom: 1px solid $color-border;
+  flex-shrink: 0;
+}
+
+.back {
+  background: none;
+  border: none;
+  color: $color-primary;
+  font-size: $font-size-base;
+  cursor: pointer;
+  padding: $spacing-xs $spacing-sm;
+}
+
+.title {
+  font-size: $font-size-md;
+  font-weight: 600;
+  margin: 0;
+}
+
+.layout {
+  display: grid;
+  grid-template-columns: 35% 65%;
+  flex: 1;
+  overflow: hidden;
+}
+
+.listPane {
+  overflow: hidden;
+  display: flex;
+  flex-direction: column;
+}
+
+.detailPane {
+  overflow: hidden;
+  display: flex;
+  flex-direction: column;
+  background: $color-surface;
+}
+
+.backToList {
+  display: none;
+  background: none;
+  border: none;
+  border-bottom: 1px solid $color-border;
+  color: $color-primary;
+  font-size: $font-size-base;
+  cursor: pointer;
+  padding: $spacing-sm $spacing-md;
+  text-align: left;
+}
+
+.loading {
+  padding: $spacing-xl;
+  color: $color-text-secondary;
+  text-align: center;
+}
+
+@media (width <= 640px) {
+  .layout {
+    grid-template-columns: 1fr;
+  }
+
+  .listPane.hidden {
+    display: none;
+  }
+
+  .detailPane {
+    display: none;
+
+    &.visible {
+      display: flex;
+    }
+  }
+
+  .backToList {
+    display: block;
+  }
+}

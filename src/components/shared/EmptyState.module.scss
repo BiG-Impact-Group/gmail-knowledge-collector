@@ -1,0 +1,33 @@
+@use '../../styles/tokens' as *;
+
+.container {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: $spacing-md;
+  padding: $spacing-2xl;
+  text-align: center;
+}
+
+.message {
+  color: $color-text-secondary;
+  font-size: $font-size-md;
+  margin: 0;
+}
+
+.action {
+  padding: $spacing-sm $spacing-lg;
+  background: $color-primary;
+  color: white;
+  border: none;
+  border-radius: $border-radius-sm;
+  font-size: $font-size-base;
+  font-weight: 500;
+  cursor: pointer;
+  transition: background $transition-fast;
+
+  &:hover {
+    background: $color-primary-dark;
+  }
+}
