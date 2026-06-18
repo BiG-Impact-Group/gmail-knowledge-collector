@@ -3,7 +3,7 @@
 **Branch:** plan/demo-readiness → feature/demo-readiness  
 **Date:** 2026-06-18  
 **Author:** Planner agent  
-**Status:** Draft — awaiting approval
+**Status:** Approved — Gate 2 passed (Codex review 2026-06-18, findings triaged)
 
 ---
 
@@ -22,19 +22,40 @@ Source of truth: Tuesday 2026-06-16 meeting transcript (Terrence Kunstek, Caleb 
 **Why:** The current collector fetches 200 messages on first sync and stops. The use case (Town of Fishers snow plow workers retiring) requires career-spanning email — 200 messages is insufficient. 12 months is the agreed starting depth; widening it later requires only clearing `sync_cursor` and `backfill_complete`.
 
 **What:**
-- Add `backfill_complete boolean NOT NULL DEFAULT false` and `backfill_page_token text` columns to `connected_accounts` (idempotent migration).
+- Add three columns to `connected_accounts` (idempotent migration):
+  - `backfill_complete boolean NOT NULL DEFAULT false`
+  - `backfill_page_token text`
+  - `backfill_start_history_id text` — historyId captured **before** page 1 is fetched; used as `sync_cursor` when backfill finishes
 - Collector logic:
-  - If `backfill_complete = false`: call `messages.list` with `maxResults=200` and a date cutoff of `after:YYYY/MM/DD` (12 months ago). Follow `nextPageToken` across cron runs using `backfill_page_token`. On the final page (no `nextPageToken`), set `backfill_complete = true`, clear `backfill_page_token`, and set `sync_cursor` from `users/me/profile`.
-  - If `backfill_complete = true`: use the existing History API incremental path (unchanged).
-- Rate: 200 messages per cron run during backfill (same as current). A typical 12-month inbox of ~2,400 messages completes in 12 runs (~1 hour at 5-min cron).
-- Existing accounts with `sync_cursor` set but `backfill_complete = false` (the default after migration) will re-enter the backfill path on next run. This is intentional — the cursor they have was set on a 200-message partial sync.
+  - **If `backfill_complete = false`:**
+    1. On the very first run for an account (no `backfill_start_history_id`): call `GET users/me/profile` to get the current `historyId`. Store it as `backfill_start_history_id`. This is the only safe cursor — it covers any messages that arrive **during** the multi-run backfill.
+    2. Call `messages.list` with `maxResults=200` and `q=after:YYYY/MM/DD` (12 months ago). Follow `nextPageToken` across cron runs via `backfill_page_token`.
+    3. On the final page (no `nextPageToken`): set `backfill_complete = true`, clear `backfill_page_token`, set `sync_cursor = backfill_start_history_id`. From this point the History API path takes over.
+  - **If `backfill_complete = true`:** use the existing History API incremental path (unchanged).
+- Rate: 200 messages per cron run per account during backfill. A typical 12-month inbox (~2,400 messages) completes in 12 runs (~1 hour at 5-min cron).
+- Existing accounts with `sync_cursor` set but `backfill_complete = false` (default after migration) re-enter the backfill path on next run. Intentional — their existing cursor was set on a 200-message partial sync.
+
+**Why `backfill_start_history_id`:** Without it, messages arriving in the inbox during a multi-run backfill have historyIds between the backfill start and end. Setting `sync_cursor` from `users/me/profile` at the end of the backfill skips those messages permanently. Capturing the historyId before page 1 ensures the History API replay covers the entire backfill window.
+
+**Deployment order:**
+1. Apply migration (`npx supabase db push --linked`)
+2. Run `npm run gen:types` and commit updated `database.types.ts`
+3. Deploy updated `gmail-collector` edge function (`npx supabase functions deploy gmail-collector`)
+
+**Rollback:** If backfill goes wrong for an account, clear `backfill_complete`, `backfill_page_token`, and `backfill_start_history_id` in the Supabase dashboard for that row. Next cron run restarts cleanly.
 
 **Migrations:**
-- `20260618000001_backfill_columns.sql` — adds `backfill_complete`, `backfill_page_token` with `IF NOT EXISTS`.
+- `20260618000001_backfill_columns.sql` — adds `backfill_complete`, `backfill_page_token`, `backfill_start_history_id` with `ADD COLUMN IF NOT EXISTS`
+- `20260618000002_messages_user_fk.sql` — adds composite FK enforcing `messages.user_id` → `connected_accounts(user_id)` (see RLS integrity below)
 
-**Tests:** Unit test for the backfill branch of the collector logic (mock `nextPageToken` present / absent).
+**Tests:** Extract the following as pure, side-effect-free functions in the collector and cover with Jest unit tests:
+- `buildBackfillQuery(after: string, pageToken?: string): string` — constructs the `messages.list` URL
+- `shouldStartBackfill(account: { backfill_start_history_id: string | null }): boolean`
+- `isBackfillComplete(pageToken: string | null): boolean`
 
-**Out of scope:** Progress UI, rate-limit backoff (noted as future work).
+The stateful parts (fetch calls, DB writes, vault reads) remain in the Edge Function body and are covered by the Gate 7 browser smoke test. Do not attempt to run the Edge Function itself in Jest.
+
+**Out of scope for EU-14:** Progress UI, rate-limit (429) backoff.
 
 ---
 
@@ -45,11 +66,17 @@ Source of truth: Tuesday 2026-06-16 meeting transcript (Terrence Kunstek, Caleb 
 **What:**
 - Add an account label (email address) to each row in the `MessageItem` component. Position: small muted badge below the sender name.
 - Add an account filter dropdown/selector in the `EmailPage` list pane header. Options: "All accounts" + one entry per connected account. Selecting an account filters the list.
-- `getMessages()` in `messages.service.ts` accepts an optional `connectedAccountId` filter parameter; when provided, adds `.eq('connected_account_id', id)` to the query.
-- `useMessages` hook passes the filter through from `EmailPage` state.
-- No new RLS or migrations required — `connected_account_id` already exists on `messages`.
+- `getMessages()` in `messages.service.ts` accepts an optional `connectedAccountId?: string` parameter; when provided, adds `.eq('connected_account_id', id)` to the query before `.order()`.
+- `useMessages(connectedAccountId?: string)` hook: passes the filter through from `EmailPage` state. Cache key must be `['messages', connectedAccountId ?? 'all']` — **not** `['messages']` — or stale data from the unfiltered view will show when a filter is selected.
+- **Account badge data path:** `MessageListItem` only has `connected_account_id`, not the account email. Build an `accountId → emailAddress` lookup map in `EmailPage` from `useAccounts()` and pass it to `MessageItem` as a `accountEmail?: string` prop. No query join needed; no change to `getMessages()` select columns.
+- Add a "Load more" button below the message list in `EmailPage`. On click, increment the page offset by 200 and fetch the next range via `getMessages()` with `.range(offset, offset + 199)`. Append results to the existing list. Without this, backfilled mail (potentially thousands of messages) is unreachable in the demo.
 
-**Tests:** Update `messages.service.test.ts` to cover the filtered path. Update `EmailPage` test for filter state.
+**No new RLS or migrations required** — `connected_account_id` already exists on `messages`.
+
+**Tests:**
+- Update `messages.service.test.ts` to cover the filtered path (`.eq()` called with the account ID, cache key includes filter).
+- Update `EmailPage` test for filter state change and "Load more" triggering next range.
+- Negative cases: filter with no messages returns empty state; "Load more" when no more results hides the button.
 
 ---
 
@@ -79,6 +106,7 @@ Source of truth: Tuesday 2026-06-16 meeting transcript (Terrence Kunstek, Caleb 
   - Supabase: project creation, Auth → Google provider setup, Site URL + Redirect URLs, Vault secret creation, edge function secrets, cron job setup
   - Netlify: site creation, environment variables, deploy branch configuration
 - Each entry: date, platform, what was done, why, any gotchas. Screenshots are encouraged but not required (describe what to look for).
+- **Redaction rule:** Document setting names and their purpose only. Never record actual values (client IDs, secrets, keys, URLs with tokens). If a step requires a specific value, note where to find it (e.g., "copy from Google Console → Credentials → OAuth 2.0 Client IDs") but do not paste the value itself.
 
 ---
 
@@ -107,13 +135,24 @@ Source of truth: Tuesday 2026-06-16 meeting transcript (Terrence Kunstek, Caleb 
 **What:**
 - Create `docs/demo-runsheet.md`.
 - Contents:
-  1. Pre-demo checklist (confirm Netlify is live, confirm at least 2 accounts connected, confirm emails visible)
+  1. Pre-demo checklist (confirm Netlify is live, confirm at least 2 accounts connected, confirm emails visible, confirm no secrets in browser console/network tab)
   2. Sign-in walkthrough (go to URL, click Continue with Google, land on Accounts page)
   3. Connect a second account (click Connect Gmail, grant consent, return to Accounts with 2 cards)
   4. Wait for collector (explain the 5-minute cron, refresh)
-  5. View emails (navigate to Emails, show list from both accounts, click one, show HTML rendering)
-  6. Talking points (12-month backfill, generic platform, future: Drive, Slack, calendar)
-  7. Out-of-scope callouts (no search yet, no vector store — collect and gather only)
+  5. View emails (navigate to Emails, use account filter to show each inbox separately, click one, show HTML rendering)
+  6. Load more (click Load more to show pagination works, demonstrating backfill depth)
+  7. Talking points (12-month backfill, generic platform, future: Drive, Slack, calendar)
+  8. Out-of-scope callouts (no search yet, no vector store — collect and gather only)
+  9. Safety checks: verify no email content appears in browser network tab requests to third-party URLs; verify no tokens visible in URL bar or console
+
+---
+
+## Known accepted risks (demo scope)
+
+The following security gaps are explicitly accepted for the internal demo (Google Testing Mode, team-only test users). They are **not** acceptable in production and must be addressed before any external user onboarding.
+
+- **OAuth nonce not validated server-side:** The HMAC-SHA256 state JWT is generated but the nonce is not stored server-side, so a captured state JWT can be replayed within its 5-minute window. Attack surface: team members only.
+- **`id_token` not signature/claim verified:** The `id_token` returned from Google's token endpoint is decoded but not verified against Google's public keys or audience claim. The token comes from Google's endpoint over HTTPS, making tampering unlikely in the team context. Both items are week-3 hardening targets.
 
 ---
 
@@ -128,6 +167,7 @@ Per Terrence's explicit deferral and the Phase A recommendation:
 - Vector store, embeddings, search, chat over data — future
 - Meeting recorder / speaker identification — week 4 bonus
 - Production prompt injection shields — production only
+- OAuth nonce server-side storage + id_token verification — week 3
 
 ---
 
@@ -135,7 +175,8 @@ Per Terrence's explicit deferral and the Phase A recommendation:
 
 | File | Change | Idempotent? |
 |---|---|---|
-| `20260618000001_backfill_columns.sql` | ADD COLUMN IF NOT EXISTS `backfill_complete`, `backfill_page_token` | Yes |
+| `20260618000001_backfill_columns.sql` | ADD COLUMN IF NOT EXISTS `backfill_complete`, `backfill_page_token`, `backfill_start_history_id` | Yes |
+| `20260618000002_messages_user_fk.sql` | ADD CONSTRAINT IF NOT EXISTS composite FK `messages(user_id)` → `connected_accounts(user_id)` | Yes |
 
 ---
 
@@ -144,7 +185,7 @@ Per Terrence's explicit deferral and the Phase A recommendation:
 | Issue | Title | Epic unit |
 |---|---|---|
 | #1 | feat: paginated 12-month backfill in gmail-collector | EU-14 |
-| #2 | feat: account attribution and filter in email viewer | EU-15 |
+| #2 | feat: account attribution, filter, and load-more in email viewer | EU-15 |
 | #3 | refactor: generic connector seam (Provider type, initiateOAuth, ConnectorConfig) | EU-16 |
 | #4 | docs: manual process journal | EU-17 |
 | #5 | chore: git pre-commit hook for lint and tests | EU-18 |
@@ -159,5 +200,5 @@ All rules from `docs/project-brief.md` and `README.md` remain in force:
 1. Tokens server-side only — no change to token handling in this epic.
 2. Browser read-only on `messages` — `getMessages()` filter parameter adds a SELECT condition only.
 3. Email is PII — not sent to any external service.
-4. Secrets never in git.
+4. Secrets never in git. Journal entries document setting names only, never values.
 5. Email content is untrusted input — no LLM feeding in this epic.
