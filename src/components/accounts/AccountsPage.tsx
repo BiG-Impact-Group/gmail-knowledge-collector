@@ -1,3 +1,4 @@
+import React from 'react'
 import { useNavigate } from 'react-router-dom'
 import { useAccounts } from '@/hooks/useAccounts'
 import { initiateOAuth } from '@/services/accounts.service'
@@ -9,6 +10,16 @@ import { supabase } from '@/lib/supabase'
 export default function AccountsPage() {
   const navigate = useNavigate()
   const { data: accounts, isLoading, error } = useAccounts()
+  const [connectError, setConnectError] = React.useState<string | null>(null)
+
+  const handleConnect = async () => {
+    setConnectError(null)
+    try {
+      await initiateOAuth('google')
+    } catch (err) {
+      setConnectError(err instanceof Error ? err.message : String(err))
+    }
+  }
 
   const handleSignOut = async () => {
     await supabase.auth.signOut()
@@ -20,7 +31,7 @@ export default function AccountsPage() {
       <header className={styles.header}>
         <h1 className={styles.title}>Connected Accounts</h1>
         <div className={styles.headerActions}>
-          <button className={styles.connectBtn} onClick={() => initiateOAuth('google')}>
+          <button className={styles.connectBtn} onClick={handleConnect}>
             Connect Gmail
           </button>
           <button className={styles.signOutBtn} onClick={handleSignOut}>
@@ -32,10 +43,11 @@ export default function AccountsPage() {
       <main className={styles.main}>
         {isLoading && <p className={styles.loading}>Loading…</p>}
         {error && <p className={styles.errorMsg}>Failed to load accounts.</p>}
+        {connectError && <p className={styles.errorMsg}>Connect error: {connectError}</p>}
         {accounts && accounts.length === 0 && (
           <EmptyState
             message="No accounts connected yet."
-            action={{ label: 'Connect Gmail', onClick: () => initiateOAuth('google') }}
+            action={{ label: 'Connect Gmail', onClick: handleConnect }}
           />
         )}
         {accounts && accounts.length > 0 && (
