@@ -1,0 +1,38 @@
+# Supabase project config. Records the per-function verify_jwt contract so a CLI redeploy can't
+# silently flip it (the CLI defaults functions to verify_jwt=true; the cron-driven collectors MUST
+# stay false, and the user-facing functions MUST stay true). Migrations/deploys in this project are
+# applied via the Supabase MCP; this file documents the deployment contract.
+project_id = "ybgtzyutbvwfhgtlmnah"
+
+# --- Cron-driven (CRON_SECRET bearer; platform JWT verification OFF so pg_cron/pg_net can call) ---
+[functions.gmail-collector]
+verify_jwt = false
+
+[functions.google-drive-collector]
+verify_jwt = false
+
+[functions.file-processor]
+verify_jwt = false
+
+[functions.embedder]
+verify_jwt = false
+
+# --- OAuth redirect / initiate (browser or Google redirect; do their own auth) ---
+[functions.google-oauth-initiate]
+verify_jwt = false
+
+[functions.google-drive-oauth-initiate]
+verify_jwt = false
+
+[functions.google-oauth-callback]
+verify_jwt = false
+
+# --- User-facing (require a valid end-user JWT) ---
+[functions.google-account-disconnect]
+verify_jwt = true
+
+[functions.google-account-delete]
+verify_jwt = true
+
+[functions.search]
+verify_jwt = true

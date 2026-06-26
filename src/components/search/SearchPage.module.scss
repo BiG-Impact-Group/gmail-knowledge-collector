@@ -1,0 +1,162 @@
+@use '@/styles/tokens' as *;
+
+.page {
+  display: flex;
+  flex-direction: column;
+  height: 100vh;
+  overflow: hidden;
+}
+
+.header {
+  display: flex;
+  align-items: center;
+  gap: $spacing-md;
+  padding: $spacing-sm $spacing-md;
+  background: $color-surface;
+  border-bottom: 1px solid $color-border;
+  flex-shrink: 0;
+}
+
+.back {
+  background: none;
+  border: none;
+  color: $color-primary;
+  font-size: $font-size-base;
+  cursor: pointer;
+  padding: $spacing-xs $spacing-sm;
+}
+
+.title {
+  font-size: $font-size-md;
+  font-weight: 600;
+  margin: 0;
+}
+
+.body {
+  flex: 1;
+  overflow-y: auto;
+  padding: $spacing-lg $spacing-md;
+  max-width: 720px;
+  width: 100%;
+  margin: 0 auto;
+}
+
+.searchForm {
+  display: flex;
+  gap: $spacing-sm;
+  margin-bottom: $spacing-lg;
+}
+
+.searchInput {
+  flex: 1;
+  padding: $spacing-sm $spacing-md;
+  border: 1px solid $color-border;
+  border-radius: $border-radius-sm;
+  background: $color-surface;
+  font-size: $font-size-base;
+  color: $color-text-primary;
+
+  &:focus {
+    outline: none;
+    border-color: $color-primary;
+  }
+}
+
+.submit {
+  padding: $spacing-sm $spacing-lg;
+  background: $color-primary;
+  border: none;
+  border-radius: $border-radius-sm;
+  color: $color-surface;
+  font-size: $font-size-base;
+  cursor: pointer;
+
+  &:hover:not(:disabled) {
+    background: $color-primary-dark;
+  }
+
+  &:disabled {
+    background: $color-text-disabled;
+    cursor: not-allowed;
+  }
+}
+
+.empty,
+.loading {
+  color: $color-text-secondary;
+  text-align: center;
+  padding: $spacing-xl;
+}
+
+.error {
+  color: $color-error;
+  text-align: center;
+  padding: $spacing-lg;
+}
+
+.results {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: $spacing-md;
+}
+
+.card {
+  background: $color-surface;
+  border: 1px solid $color-border;
+  border-radius: $border-radius-md;
+  padding: $spacing-md;
+  box-shadow: $shadow-sm;
+}
+
+.cardHeader {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: $spacing-sm;
+  margin-bottom: $spacing-sm;
+}
+
+.source {
+  font-weight: 600;
+  font-size: $font-size-base;
+  color: $color-primary;
+  text-decoration: none;
+  overflow-wrap: anywhere;
+
+  &:hover {
+    text-decoration: underline;
+  }
+}
+
+a.source {
+  cursor: pointer;
+}
+
+span.source {
+  color: $color-text-primary;
+}
+
+.score {
+  flex-shrink: 0;
+  font-size: $font-size-sm;
+  color: $color-text-secondary;
+  white-space: nowrap;
+}
+
+.passage {
+  margin: 0;
+  font-size: $font-size-base;
+  color: $color-text-primary;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  line-height: 1.5;
+}
+
+@media (width <= 640px) {
+  .body {
+    padding: $spacing-md $spacing-sm;
+  }
+}
