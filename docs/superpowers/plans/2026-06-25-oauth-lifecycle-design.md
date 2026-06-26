@@ -14,6 +14,7 @@
 | 1 | 2026-06-25 | Initial spec from brainstorm |
 | 2 | 2026-06-25 | Codex plan review v1 — fixed constraint name, revoke error handling, vault_delete_secret grants, reconnect JWT binding, GET→POST initiate, callback conflict target, test gaps, rollback note, safety criteria |
 | 3 | 2026-06-25 | Codex plan review v2 — reconnect state reset, collector race real fix, Vault-before-row delete ordering, migration split for zero-downtime, cache invalidation, error-status disconnect, CORS/validation note, handoff path |
+| 4 | 2026-06-25 | Codex plan review v3 — mismatch revoke on reconnect, atomic collector write guard, disconnect status ordering (revoke-then-mark), gen:types after every migration |
 
 ---
 
@@ -173,16 +174,16 @@ GRANT EXECUTE ON FUNCTION vault_delete_secret(text) TO service_role;
 3. Fetch refresh token from Vault by `account.id`
    - Vault RPC error (not null result, actual error): return `502`; do not proceed
    - `data === null && !error` (secret genuinely missing): proceed with empty token (Google will 400, treat as terminal)
-4. `UPDATE connected_accounts SET status = 'revoked', sync_cursor = NULL WHERE id = accountId` — **mark revoked BEFORE purge** to stop in-flight collector writes
-5. POST to `https://oauth2.googleapis.com/revoke` with `Content-Type: application/x-www-form-urlencoded` body `token=<refresh_token>` (not query string — avoids token in logs)
+4. POST to `https://oauth2.googleapis.com/revoke` with `Content-Type: application/x-www-form-urlencoded` body `token=<refresh_token>` (not query string — avoids token in logs)
    - `2xx` → success, proceed
    - `400 / 401 / 403` → terminal (token already dead), proceed
-   - `5xx` or network error → return `502`; leave `status = 'revoked'` (collector will not reinsert); Vault token retained for retry
-6. Call `vault_delete_secret(account.id)` — Vault delete fails: log error, return `500`; row already revoked so no data risk
-7. If `purgeMessages === true`: `DELETE FROM messages WHERE connected_account_id = accountId` (service role)
+   - `5xx` or network error → return `502`; nothing has been changed yet; Vault token retained; user can retry
+5. Call `vault_delete_secret(account.id)` — Vault delete fails: log error, return `500`; nothing purged yet, user can retry
+6. `UPDATE connected_accounts SET status = 'revoked', sync_cursor = NULL WHERE id = accountId` (service role) — **mark revoked AFTER successful revoke and Vault deletion**
+7. If `purgeMessages === true`: `DELETE FROM messages WHERE connected_account_id = accountId AND EXISTS (SELECT 1 FROM connected_accounts WHERE id = accountId AND status = 'revoked')` — atomic guard: only purge if status is confirmed revoked
 8. Return `200 { success: true }`
 
-**Collector race (real fix):** Step 4 marks `status = 'revoked'` before any purge. The `gmail-collector` filters to `status = 'active'` accounts at startup, but in-flight writes for an already-running collector run must also be guarded. EU-26-9 (collector guard) adds a status re-check before the collector upserts messages for each account — if the account is no longer active mid-run, the account is skipped.
+**Collector race (atomic guard):** EU-26-9 updates the collector's message upsert to include `WHERE connected_account_id = $1 AND EXISTS (SELECT 1 FROM connected_accounts WHERE id = $1 AND status = 'active')` — if the account is revoked between check and write, the upsert produces zero rows. This is atomic at the DB level; no advisory lock needed.
 
 ### New function: `google-account-delete`
 
@@ -219,7 +220,7 @@ GRANT EXECUTE ON FUNCTION vault_delete_secret(text) TO service_role;
 
 **Callback update (EU-26-8):** `google-oauth-callback` currently upserts with `onConflict: 'user_id,email_address'` (line 156). After Migration 1 removes that constraint, this will fail. Must update to `onConflict: 'user_id,provider,email_address'` and deploy alongside the migration.
 
-**Reconnect validation in callback:** When `reconnect_account_id` is present in the state JWT, verify the Google-returned email matches the `email_address` on the `connected_accounts` row. If mismatch, return `400` — prevents authorizing account B when reconnecting account A.
+**Reconnect validation in callback:** When `reconnect_account_id` is present in the state JWT, verify the Google-returned email matches the `email_address` on the `connected_accounts` row. If mismatch: POST-revoke the newly issued refresh token (same body format as disconnect — treat 4xx as success, log 5xx but proceed), then return `400`. This prevents a live untracked Google grant from being issued to account B while reconnecting account A.
 
 **Reconnect state reset in callback:** After a successful reconnect upsert, reset `backfill_complete = false`, `backfill_page_token = NULL`, `backfill_start_history_id = NULL`, and `sync_cursor = NULL` on the account row. This forces the collector to re-run a full backfill from the new grant, preventing the collector from calling `history?startHistoryId=null` (which would error) when `backfill_complete` is still true but `sync_cursor` is null from a prior disconnect.
 
@@ -309,7 +310,9 @@ No new RLS policies. All writes (UPDATE status, DELETE messages, DELETE connecte
 - Disconnect: Vault token missing → empty-token revoke → 400 → proceeds
 - Delete: cross-user `accountId` returns 404
 - Delete: Google `5xx` returns 502, does not delete row
-- Reconnect callback: email mismatch on reconnect returns 400
+- Reconnect callback: email mismatch revokes the newly issued token then returns 400
+- Reconnect callback: email mismatch with revoke 5xx still returns 400 (best-effort revoke)
+- Disconnect: Google 5xx returns 502 with no status change, no Vault deletion, no purge
 - No token or account data logged at any severity level
 
 ---
@@ -341,7 +344,7 @@ No new RLS policies. All writes (UPDATE status, DELETE messages, DELETE connecte
 Migration 1 is split into 1a and 1b to eliminate the deployment window where the callback and constraint are out of sync.
 
 1. **Migration 1a** — ADD `UNIQUE (user_id, provider, email_address)` (old constraint still present) → confirm Remote column → `npm run gen:types`
-2. **Migration 2** — `vault_delete_secret` helper → confirm Remote column
+2. **Migration 2** — `vault_delete_secret` helper → confirm Remote column → `npm run gen:types` (invariant: run after every migration)
 3. **EU-26-8** — Deploy `google-oauth-callback` with updated conflict target (`user_id,provider,email_address`) and reconnect email-match validation
 4. **Migration 1b** — DROP `connected_accounts_user_email_unique` (now safe — callback already uses new target) → confirm Remote column
 5. Deploy `google-account-disconnect` edge function
