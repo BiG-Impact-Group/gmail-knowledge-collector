@@ -143,6 +143,7 @@ Deno.serve(async (req: Request) => {
     .from('connected_accounts')
     .select('id, user_id, email_address, sync_cursor, backfill_complete, backfill_page_token, backfill_start_history_id')
     .eq('status', 'active')
+    .eq('provider', 'google')
 
   if (accountsError) {
     return Response.json({ error: 'Failed to fetch accounts' }, { status: 500 })
