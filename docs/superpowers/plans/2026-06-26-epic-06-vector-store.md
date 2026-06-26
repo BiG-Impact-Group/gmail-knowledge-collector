@@ -1,109 +1,150 @@
 # Epic 06 — vector-store
 
-**Status:** Draft — pending Codex plan review
+**Status:** Rev 2 — post Codex plan review v1 (3 criticals + importants addressed)
 **Date:** 2026-06-26
 **Base branch:** `test` (Epics 03/04/05 merged). Build branch: `feature/epic-06-vector-store`.
-**Depends on:** Epic 05 (`documents.text_content` populated for `content_status='extracted'` Workspace files + converted binaries).
+**Depends on:** Epic 05 (`documents.text_content` populated for `content_status='extracted'`).
 
 ## Goal
 
-Embed extracted document text **in-boundary** and store vectors for retrieval (Epic 07). No external API/model: embeddings come from Supabase Edge Runtime's built-in `gte-small` (`new Supabase.ai.Session('gte-small')`, 384-dim, `mean_pool:true, normalize:true`). No user-visible UI this epic — it populates a `chunks` table that Epic 07's RAG queries. Verified at the DB level.
+Embed extracted document text **in-boundary** (Supabase Edge Runtime built-in `gte-small`, 384-dim) and store vectors for Epic 07 retrieval. No external API/model. No user-visible UI; populates `chunks`. Verified at the DB level. **Document-only this epic** (email-body embedding is a later, separate source — `chunks.document_id` is NOT NULL, so it is genuinely document-scoped now; no false "polymorphic later" claim, Codex #10).
 
 ## Confirmed gate (gte-small)
+`const model = new Supabase.ai.Session('gte-small'); const e = await model.run(text, { mean_pool: true, normalize: true })` → 384 normalized floats, in-boundary. Normalized → inner-product HNSW (`vector_ip_ops`), query `ORDER BY embedding <#> $q` (Codex #9). Dimension fixed at 384.
 
-Supabase docs confirm `gte-small` runs natively in Edge Functions (edge-runtime ≥ v1.36.0), no external call: `const model = new Supabase.ai.Session('gte-small'); const embedding = await model.run(content, { mean_pool: true, normalize: true })` → 384-dim. Normalized vectors → use inner-product distance (`vector_ip_ops`) HNSW index (IP == cosine for unit vectors). Dimension is fixed at 384 at migration time.
+## Core correctness decisions (from review)
 
-## Design — mirror Epic 05's hardened job pipeline
-
-Epic 06 is a second processing stage with the **same concurrency hazards** Epic 05 already solved. Reuse that exact pattern (advisory + row locks, lease guard, lifecycle-version + content-version rechecks, account→document→job lock order, claim-one-at-a-time, cap-fail). A separate `embedding_jobs` queue keeps stages independent (file-conversion vs embedding).
+- **Content version everywhere (Codex C1/C2).** A document's `drive_modified_time` is its content version. `embedding_jobs.source_version` and `chunks.source_version` both record the version they embedded. Enqueue/reopen only when the version is missing or changed; retrieval and cleanup key off version so **stale chunks are never returned and are purged**.
+- **Embedding never regresses the document (Codex C3).** Neither `claim_embedding_jobs` cap-fail nor `complete_embedding_job` ever writes `documents` (no `content_status`/`text_content` mutation). Embedding is best-effort; the `/documents` viewer is unaffected by embedding failures.
+- **Reuse the FINAL Epic 05 lock discipline (Codex #4):** base `complete_embedding_job` on `20260627020001_complete_job_lock_order.sql` — unlocked id derivation, then `connected_accounts → documents → embedding_jobs` lease lock, lifecycle + content-version + `content_status='extracted'` rechecks — replacing only the outcome (chunk delete+insert).
 
 ### Safety rules
-1. **In-boundary only.** Embeddings via `Supabase.ai` gte-small inside the edge function. Chunk text + vectors stored in Supabase. Nothing leaves the boundary.
-2. **Browser read-only.** `chunks` + `embedding_jobs`: SELECT-own RLS + `REVOKE INSERT/UPDATE/DELETE FROM anon, authenticated`. Writes via service_role SECURITY DEFINER RPCs only.
-3. **Composite FK** `(user_id, document_id) → documents(user_id, id)` on both `chunks` and `embedding_jobs` (cross-user guard; `documents` already has `UNIQUE(user_id,id)` from Epic 05).
-4. **Untrusted content.** Chunk text is still untrusted; Epic 07 applies injection shielding before any generative step. Embedding the text does not execute it.
-5. Secrets in Vault; no content/PII in logs (job `last_error` = fixed codes).
+In-boundary embeddings only; browser read-only on `chunks`/`embedding_jobs` (SELECT-own RLS + REVOKE DML); writes via service_role SECURITY DEFINER RPCs; composite FK `(user_id, document_id)→documents(user_id,id)`; idempotent migrations; chunk text untrusted (Epic 07 shields before generation); no PII in logs.
 
 ## Data model
 
 ### Migration 1 — `enable_pgvector`
-`CREATE EXTENSION IF NOT EXISTS vector WITH SCHEMA extensions;` (idempotent).
+`CREATE EXTENSION IF NOT EXISTS vector WITH SCHEMA extensions;`
 
 ### Migration 2 — `chunks`
 ```sql
 CREATE TABLE IF NOT EXISTS chunks (
-  id            uuid PRIMARY KEY DEFAULT gen_random_uuid(),
-  user_id       uuid NOT NULL REFERENCES auth.users(id) ON DELETE CASCADE,
-  document_id   uuid NOT NULL,
-  chunk_index   integer NOT NULL,
-  content       text NOT NULL,
-  embedding     extensions.vector(384) NOT NULL,
-  created_at    timestamptz NOT NULL DEFAULT now(),
+  id              uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+  user_id         uuid NOT NULL REFERENCES auth.users(id) ON DELETE CASCADE,
+  document_id     uuid NOT NULL,
+  source_version  timestamptz,                 -- documents.drive_modified_time embedded (NULL ok)
+  chunk_index     integer NOT NULL,
+  content         text NOT NULL,
+  embedding       extensions.vector(384) NOT NULL,
+  created_at      timestamptz NOT NULL DEFAULT now(),
   CONSTRAINT chunks_doc_index_unique UNIQUE (document_id, chunk_index),
   CONSTRAINT chunks_user_document_fk
     FOREIGN KEY (user_id, document_id) REFERENCES documents(user_id, id) ON DELETE CASCADE
 );
+```
+RLS + grants + indexes, all via idempotent DO-blocks / `IF NOT EXISTS` (Codex #7):
+```sql
 ALTER TABLE chunks ENABLE ROW LEVEL SECURITY;
-CREATE POLICY "users select own chunks" ON chunks FOR SELECT TO authenticated USING ((select auth.uid()) = user_id);
-REVOKE INSERT, UPDATE, DELETE ON chunks FROM anon, authenticated;
+-- DO-block create policy "users select own chunks" FOR SELECT TO authenticated USING ((select auth.uid())=user_id)
+REVOKE ALL ON TABLE chunks FROM anon, authenticated;
 GRANT SELECT ON chunks TO authenticated;
--- ANN index for normalized gte-small vectors (inner product == cosine):
 CREATE INDEX IF NOT EXISTS chunks_embedding_hnsw ON chunks USING hnsw (embedding extensions.vector_ip_ops);
 CREATE INDEX IF NOT EXISTS chunks_user_id_idx ON chunks (user_id);
 CREATE INDEX IF NOT EXISTS chunks_document_id_idx ON chunks (document_id);
 ```
-Source scoped to **documents** this epic; a `source_type` (+ message_id) can be added later for email-body embedding without disturbing this schema. Self-repair DO-blocks for FK/policy (mirror Epic 05).
+Self-repair DO-blocks ensure the composite FK + unique + policy exist on a partial table (mirror `processing_jobs`).
 
-### Migration 3 — `embedding_jobs` + RPCs (mirror processing_jobs)
-`embedding_jobs` table identical in shape to `processing_jobs` (id, user_id, document_id UNIQUE, status pending|processing|done|failed, attempts, last_error, claimed_at, timestamps; composite FK; RLS SELECT-own + REVOKE DML; claim index). RPCs (`SECURITY DEFINER SET search_path=public`, service_role only), copied from Epic 05's hardened versions with embedding semantics:
+### Migration 2b — `documents_extracted_idx` (Codex #8)
+Enqueue scans extracted docs every 5 min, but `documents_content_status_idx` excludes `extracted`. Add:
+```sql
+CREATE INDEX IF NOT EXISTS documents_extracted_idx ON documents (id)
+  WHERE content_status = 'extracted';
+```
 
-- **`enqueue_embedding_jobs()`** — insert a pending job for every `documents` row with `content_status='extracted' AND text_content IS NOT NULL`; ON CONFLICT reopen terminal jobs (so a re-extracted/changed doc re-embeds).
-- **`claim_embedding_jobs(p_limit, p_stale_seconds, p_max_attempts)`** — same as `claim_processing_jobs`: cap-fail stale-over-max jobs, `FOR UPDATE SKIP LOCKED`, active google_drive account join, `d.content_status='extracted'` eligibility, returns lease (claimed_at) + lifecycle_version + drive_modified_time + the document's text via... NO — do not return large text from the RPC; return `document_id` and the edge function reads `text_content` separately under no lock (it's the user's own data; the complete RPC re-verifies version). Return `(job_id, document_id, user_id, attempts, claimed_at, connected_account_id, lifecycle_version, drive_modified_time)`.
-- **`complete_embedding_job(p_job_id, p_claimed_at, p_attempts, p_lifecycle_version, p_drive_modified_time, p_outcome, p_chunks jsonb, p_error, p_max_attempts)`** — same lock order as Epic 05's fixed `complete_processing_job` (account→document→job), same lease + lifecycle + content-version + `content_status='extracted'` rechecks. On `'done'`: `DELETE FROM chunks WHERE document_id=v_doc` then bulk-insert `p_chunks` (array of {chunk_index, content, embedding}). On `'retry'`/cap → job failed (no document status change — documents stays 'extracted'; embedding is best-effort and does not regress the viewer). No `'skipped'` document mutation (embedding failure must not hide the document text).
+### Migration 3 — `embedding_jobs` + RPCs
+`embedding_jobs`: `processing_jobs` shape **plus** `source_version timestamptz`, `chunk_count integer`, `truncated boolean DEFAULT false` (Codex #11). Composite FK, RLS SELECT-own + REVOKE DML, claim index, self-repair — all idempotent.
 
-> Embedding failures never change `documents.content_status` — the extracted text stays visible regardless; only retrieval coverage is affected.
+**`enqueue_embedding_jobs()`** — version-aware (Codex C1). Insert/reopen only when the embedded version differs from the document's current version:
+```sql
+INSERT INTO public.embedding_jobs (user_id, document_id, source_version)
+SELECT d.user_id, d.id, d.drive_modified_time
+FROM public.documents d
+WHERE d.content_status='extracted' AND d.text_content IS NOT NULL
+ON CONFLICT (document_id) DO UPDATE
+  SET status='pending', attempts=0, claimed_at=NULL, last_error=NULL,
+      source_version=EXCLUDED.source_version, updated_at=now()
+  WHERE public.embedding_jobs.source_version IS DISTINCT FROM EXCLUDED.source_version;
+```
+A `done`/`failed` job for the **same** version is left alone → no infinite re-embed, no infinite failure-retry (Codex C1). A changed document (`drive_modified_time` differs) reopens.
+
+**Stale-chunk purge (Codex C2)** — runs in `enqueue_embedding_jobs()` after the insert (or a dedicated `purge_stale_chunks()` called each run): delete chunks whose document is no longer extracted or whose version no longer matches:
+```sql
+DELETE FROM public.chunks c
+WHERE NOT EXISTS (
+  SELECT 1 FROM public.documents d
+  WHERE d.id = c.document_id
+    AND d.content_status = 'extracted'
+    AND d.drive_modified_time IS NOT DISTINCT FROM c.source_version
+);
+```
+(FK cascade already removes chunks when a document/account is deleted; this also clears chunks for docs that went `needs_processing`/`needs_ocr`/`skipped` or whose content changed.)
+
+**`claim_embedding_jobs(p_limit, p_stale_seconds, p_max_attempts)`** — like `claim_processing_jobs` BUT cap-fail touches **only `embedding_jobs`** (never documents — Codex C3). `FOR UPDATE OF pj SKIP LOCKED`; eligibility = active google_drive account + `d.content_status='extracted'` + `(pending OR stale processing under max)`. Returns `(job_id, document_id, user_id, attempts, claimed_at, connected_account_id, lifecycle_version, drive_modified_time)`. No text, no file name.
+
+**`complete_embedding_job(p_job_id, p_claimed_at, p_attempts, p_lifecycle_version, p_drive_modified_time, p_outcome, p_chunks jsonb, p_error, p_max_attempts)`** — based on `complete_job_lock_order.sql` (account→document→job locks; lease + lifecycle_version + `drive_modified_time` + `content_status='extracted'` rechecks). **Never writes `documents`.** Outcomes:
+- `'done'`: validate `p_chunks` in SQL first (Codex #6) — `jsonb_array_length` ≤ `MAX_CHUNKS`, each element has integer `chunk_index`, non-empty `content` within a length cap, and a 384-element `embedding`; cast `(elem->>'embedding')::extensions.vector` and rely on the `vector(384)` column to reject wrong dimension. On validation failure → job `failed`, `last_error='invalid_chunks'`, return (no document write). On success: `DELETE FROM chunks WHERE document_id=v_doc; INSERT` the new chunks with `source_version = p_drive_modified_time`; set job `done`, `chunk_count`, `truncated`.
+- `'retry'`: if `attempts >= max` → job `failed`; else job `pending`, `claimed_at=NULL`. (Document untouched either way.)
 
 ### Migration 4 — `embedder_cron`
-pg_cron `embed-documents-every-5min` → `net.http_post` to `embedder` with `CRON_SECRET` (mirror processor_cron). Scheduled LAST.
+pg_cron `embed-documents-every-5min` → `net.http_post` to `embedder` with `CRON_SECRET`. Scheduled LAST.
 
 ## Edge function — `embedder`
-CRON_SECRET bearer. Constants: `MAX_JOBS_PER_RUN=3`, `STALE_SECONDS=600`, `MAX_ATTEMPTS=3`, `RUN_DEADLINE_MS=50_000`, `CHUNK_TARGET_CHARS=1500`, `CHUNK_OVERLAP_CHARS=200`, `MAX_CHUNKS_PER_DOC=200`. Per run: `enqueue_embedding_jobs()`, then claim-one-at-a-time (deadline-gated, like Epic 05):
-1. Read `documents.text_content` for the job's document (service role).
-2. **Chunk** the text (pure helper `chunkText`): split on paragraph/sentence boundaries into ~`CHUNK_TARGET_CHARS` windows with `CHUNK_OVERLAP_CHARS` overlap; cap at `MAX_CHUNKS_PER_DOC` (excess → truncate, log a count, no PII).
-3. **Embed** each chunk: `await model.run(chunk, { mean_pool: true, normalize: true })` (one `Supabase.ai.Session('gte-small')` per run). On model error → `complete(..., 'retry')`.
-4. `complete_embedding_job(..., 'done', chunks=[{chunk_index, content, embedding}])` — RPC deletes old chunks + inserts new, under the locks/guards. Pass the lease + lifecycle_version + drive_modified_time.
-5. Check the complete RPC error (don't count a failed completion as success). Return `{ enqueued, claimed, embedded_docs, total_chunks, retried, complete_errors }`.
+CRON_SECRET bearer. Calibrated caps (Codex #5): `MAX_JOBS_PER_RUN=2`, `MAX_CHUNKS_PER_DOC=50`, `STALE_SECONDS=600`, `MAX_ATTEMPTS=3`, `RUN_DEADLINE_MS=45_000`, `CHUNK_TARGET_CHARS=1500`, `CHUNK_OVERLAP_CHARS=200`, `MAX_CONTENT_CHARS=200_000` (cap text read). One `Supabase.ai.Session('gte-small')` per run. Per run: `enqueue_embedding_jobs()` (also purges stale chunks), then claim-one-at-a-time (deadline-gated):
+1. Read `documents.text_content` (truncate to `MAX_CONTENT_CHARS`).
+2. `chunkText(text, {...})` → ≤ `MAX_CHUNKS_PER_DOC` chunks (excess truncated → set `truncated=true`).
+3. For each chunk: **deadline-check before each `model.run`** (Codex #5); if the deadline is near, `complete(..., 'retry', 'embedding_deadline')` and stop. Else embed.
+4. `complete_embedding_job(..., 'done', chunks=[{chunk_index, content, embedding}], chunk_count, truncated)` with lease+lifecycle_version+drive_modified_time. Check the RPC error; don't count a failed completion as success.
+5. Return `{ enqueued, claimed, embedded_docs, total_chunks, retried, complete_errors }`.
 
-**Pure helper** `src/lib/chunking.ts`: `chunkText(text, {targetChars, overlapChars, maxChunks})` → `string[]` — unit-tested (boundary splitting, overlap, max-chunk cap, empty/whitespace input).
+**Pure helper** `src/lib/chunking.ts`: `chunkText(text, {targetChars, overlapChars, maxChunks})` → `string[]`, unit-tested.
 
-## Cross-epic tweak
-None required: `enqueue_embedding_jobs` discovers extracted docs directly via `content_status='extracted'`, so Epic 05 needs no change. (When Epic 05 re-extracts a changed file, `drive_modified_time` changed → the embedding job's content-version recheck forces a re-embed.)
+## Epic 07 retrieval contract (documented now, built in 07)
+Retrieval MUST filter to current, extracted content so stale chunks are never returned (Codex C2/C9), and run under the user's RLS:
+```sql
+SELECT c.content, c.document_id
+FROM chunks c JOIN documents d ON d.id = c.document_id
+WHERE d.content_status = 'extracted'
+  AND c.source_version IS NOT DISTINCT FROM d.drive_modified_time
+ORDER BY c.embedding <#> $1   -- $1 = query embedding (gte-small, normalized)
+LIMIT $2;
+```
+Tune `hnsw.ef_search` in Epic 07.
 
 ## Deployment order
 1. Migration 1 `enable_pgvector` → confirm Remote.
-2. Migration 2 `chunks` → confirm Remote → `gen:types`, commit.
+2. Migration 2 `chunks` + 2b `documents_extracted_idx` → confirm Remote → `gen:types`, commit.
 3. Migration 3 `embedding_jobs` + RPCs → confirm Remote → `gen:types`, commit.
-4. Deploy `embedder` edge function.
-5. Smoke-invoke with `CRON_SECRET` (no extracted docs → zeros; else embeds).
+4. Deploy `embedder`.
+5. Smoke-invoke with `CRON_SECRET` (no extracted docs → zeros; else embeds; confirm chunk rows + dimension).
 6. Migration 4 `embedder_cron`.
 
 ## Tests
-- `src/lib/chunking.test.ts`: target size, overlap, max-chunk cap, empty/whitespace, no mid-word explosion.
-- Migration/RLS: `chunks` + `embedding_jobs` authenticated cannot DML, SELECT own only; composite FK rejects cross-user; RPCs not executable by anon/authenticated; claim concurrency-safe + active-account + content_status='extracted'; complete lease+lock-order+version rechecks; HNSW index exists.
-- Embedding/retrieval validated at DB level (query chunks count + a sample `ORDER BY embedding <#> query_embedding`).
+- `src/lib/chunking.test.ts`: target size, overlap, max-chunk cap (+truncated signal), empty/whitespace, no mid-word loss.
+- Migration/RLS: `chunks`/`embedding_jobs` authenticated cannot DML, SELECT own only; composite FK rejects cross-user; RPCs not anon/authenticated; `claim_embedding_jobs` cap-fail never touches documents; `complete_embedding_job` never writes documents, validates chunks (rejects non-384/empty), deletes+inserts under version recheck; `enqueue` is version-idempotent (no reopen for same version) and purges stale chunks; HNSW index + `vector(384)` present.
+- DB-level retrieval sanity: insert→embed a sample doc, confirm chunk count + `ORDER BY embedding <#> q` returns it; change `drive_modified_time` → stale chunks purged + not returned.
 
 ## Rollback runbook
 1. `SELECT cron.unschedule('embed-documents-every-5min');`
-2. Disable/redeploy `embedder`. Additive data: `chunks`/`embedding_jobs` don't affect the viewer; to re-embed, delete a doc's chunks + its embedding_job. pgvector extension stays.
+2. Disable/redeploy `embedder`. Additive: `chunks`/`embedding_jobs` don't affect the viewer; pgvector stays. To re-embed: delete a doc's chunks + its embedding_job (or bump nothing — enqueue re-embeds on version change).
 
 ## Work units
 | # | Unit |
 |---|---|
 | EU-06-1 | Migration: enable pgvector |
-| EU-06-2 | Migration: chunks table (vector(384), HNSW ip index, RLS, composite FK, self-repair) |
-| EU-06-3 | Migration: embedding_jobs + enqueue/claim/complete RPCs (mirror hardened Epic 05) |
+| EU-06-2 | Migration: chunks (vector(384) + source_version, HNSW ip index, RLS, composite FK, self-repair) + documents_extracted_idx |
+| EU-06-3 | Migration: embedding_jobs (+source_version/chunk_count/truncated) + enqueue(version-aware + stale-chunk purge)/claim(no doc mutation)/complete(no doc mutation, chunk validation, version-stamped) RPCs |
 | EU-06-4 | Migration: embedder_cron (last) |
-| EU-06-5 | Edge function: embedder (chunk → gte-small embed → complete) |
+| EU-06-5 | Edge function: embedder (chunk → gte-small embed, deadline-gated → complete) |
 | EU-06-6 | Pure helper + tests: src/lib/chunking.ts |
 | EU-06-7 | gen:types + commit (paired with migrations 2 & 3) |
 | EU-06-8 | Migration/RLS tests |
