@@ -294,11 +294,14 @@ Deno.serve(async (req: Request) => {
         }
       }
 
-      // Vault write succeeded — mark account active
+      // Vault write succeeded — mark account active, GUARDED on the version we set above.
+      // If a disconnect/delete landed after our guarded update (bumping the version again),
+      // this matches 0 rows → abort + revoke, so we never resurrect a just-revoked account.
       const { data: activatedRows, error: activateErr } = await supabaseAdmin
         .from('connected_accounts')
         .update({ status: 'active', updated_at: new Date().toISOString() })
         .eq('id', account.id)
+        .eq('lifecycle_version', guardVersion + 1)
         .select('id')
       if (activateErr || !activatedRows?.length) {
         console.error('Mark active failed (reconnect):', JSON.stringify(activateErr))
@@ -341,13 +344,14 @@ Deno.serve(async (req: Request) => {
           onConflict: 'user_id,provider,email_address',
           ignoreDuplicates: false,
         })
-        .select('id')
+        .select('id, lifecycle_version')
         .single()
 
       if (upsertError || !account) {
         console.error('Upsert error:', JSON.stringify(upsertError))
         throw new Error('upsert_failed')
       }
+      const upsertVersion = account.lifecycle_version
 
       // Store refresh token in Vault keyed by account id
       const { data: existingSecretId, error: vaultLookupError } = await supabaseAdmin
@@ -379,11 +383,13 @@ Deno.serve(async (req: Request) => {
         }
       }
 
-      // Vault write succeeded — mark account active
+      // Vault write succeeded — mark account active, GUARDED on the version from the upsert.
+      // A disconnect/delete landing in this window bumps lifecycle_version → 0 rows → abort + revoke.
       const { data: activatedRows, error: activateErr } = await supabaseAdmin
         .from('connected_accounts')
         .update({ status: 'active', updated_at: new Date().toISOString() })
         .eq('id', account.id)
+        .eq('lifecycle_version', upsertVersion)
         .select('id')
       if (activateErr || !activatedRows?.length) {
         console.error('Mark active failed (new connection):', JSON.stringify(activateErr))

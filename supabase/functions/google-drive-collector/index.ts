@@ -64,6 +64,7 @@ interface ConnectedAccountRow {
   sync_cursor: string | null
   backfill_complete: boolean
   backfill_page_token: string | null
+  lifecycle_version: number
 }
 
 interface DocRow {
@@ -303,7 +304,7 @@ Deno.serve(async (req: Request) => {
 
   const { data: accounts, error: accountsError } = await supabaseAdmin
     .from('connected_accounts')
-    .select('id, user_id, email_address, sync_cursor, backfill_complete, backfill_page_token')
+    .select('id, user_id, email_address, sync_cursor, backfill_complete, backfill_page_token, lifecycle_version')
     .eq('status', 'active')
     .eq('provider', 'google_drive')
 
@@ -331,13 +332,15 @@ Deno.serve(async (req: Request) => {
       } catch (err: unknown) {
         const tokenErr = err as { tokenError?: string }
         if (tokenErr.tokenError === 'invalid_grant' || tokenErr.tokenError === 'token_revoked') {
-          // Guard on status='active' so a stale in-flight collector can't clobber a
-          // concurrent user disconnect/revoke.
+          // Guard on status='active' AND the lifecycle_version read at the start of this run:
+          // if a reconnect bumped the version (new token issued) or the user disconnected,
+          // this stale failure must NOT mark the fresh/revoked account error.
           await supabaseAdmin
             .from('connected_accounts')
             .update({ status: 'error', updated_at: new Date().toISOString() })
             .eq('id', account.id)
             .eq('status', 'active')
+            .eq('lifecycle_version', account.lifecycle_version)
         }
         errors++
         continue
