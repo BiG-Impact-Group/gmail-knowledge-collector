@@ -1,6 +1,6 @@
 # Epic 04 Design: drive-collector
 
-**Status:** Rev 3 — post Codex plan review v2 (1 new critical + 6 importants accepted and addressed; v1's 3 criticals + 10 importants resolved in Rev 2)  
+**Status:** Rev 4 — post Codex plan review v3 (1 new critical [purge-race RPC] + 2 importants + 1 partial addressed; v1/v2 findings resolved in Rev 2/3)  
 **Date:** 2026-06-26  
 **Builder base branch:** `feature/epic-03-oauth-lifecycle` (stacked; merges when Epic 03 lands in `test`)  
 **Build branch:** `feature/epic-04-drive-collector`
@@ -55,7 +55,7 @@ Confirmed. Epic 04 stores `content_status = 'needs_processing'` for binary files
 - Incremental: Drive Changes API (`/changes?pageToken=<sync_cursor>`)
 - `backfill_start_history_id` not applicable to Drive — set to `NULL` always.
 
-**Documents collector writes:** Direct service-role upserts (no advisory-lock RPC, unlike the Gmail `collect_account_messages` path). To avoid a purge/collection race re-inserting rows after a disconnect, the collector **re-checks `status = 'active'`** before persisting cursor/backfill state and before each upsert batch — the same guard Epic 03 added to `gmail-collector`. A formal advisory-lock RPC for documents is deferred to Epic 05 if contention proves real; Drive files change far less frequently than Gmail messages, so the status re-check is sufficient for the demo.
+**Documents collector writes — advisory-lock RPC (Codex v2/v3 critical):** A non-atomic `status='active'` re-check followed by a separate upsert is a TOCTOU race: a `lifecycle_disconnect(..., purge=true)` can delete documents in the window between the check and the upsert, and the collector then re-inserts purged PII. This is the identical race Epic 03 fixed for messages with `collect_account_messages`. Mirror that exactly with a `collect_account_documents` RPC (Migration `documents_collect_rpc`): `SECURITY DEFINER`, takes `pg_advisory_xact_lock(hashtext(p_account_id::text))`, re-checks `status='active'` **inside the same transaction**, upserts the page's documents, and writes the cursor/backfill state — all atomic. The collector calls this RPC for every page write instead of direct `.upsert()`. REVOKE from PUBLIC/anon/authenticated, GRANT to service_role only. Deletions (removed/trashed files, 410 purge) also go through a locked RPC path (`delete_account_documents(p_account_id, p_file_ids[])` and the purge inside `lifecycle_disconnect`, which already holds the same advisory lock from Epic 03).
 
 **Purge extension:** Update `lifecycle_disconnect` (via `lifecycle_rpcs_v5` migration) to also execute `DELETE FROM documents WHERE connected_account_id = p_account_id` when `p_purge = true`. Drive accounts will be shown in `AccountCard` alongside Gmail accounts and share the same disconnect/delete UI. The `documents` table FK is `ON DELETE CASCADE`, so `lifecycle_delete` (which deletes the `connected_accounts` row) already cascades to documents automatically.
 
@@ -203,7 +203,121 @@ $$;
 
 Full function body is identical to `lifecycle_rpcs_v3` except for the added documents purge. Same REVOKE/GRANT pattern.
 
-### Migration 3 — `drive_cron`
+### Migration 3 — `documents_collect_rpc`
+
+Atomic, advisory-locked document upsert + cursor write, mirroring `collect_account_messages` (Codex v3 critical). Closes the purge/collection TOCTOU race.
+
+```sql
+CREATE OR REPLACE FUNCTION collect_account_documents(
+  p_account_id uuid,
+  p_documents jsonb,           -- array of document rows to upsert
+  p_backfill_complete boolean, -- null = leave unchanged
+  p_backfill_page_token text,  -- null = leave unchanged (sentinel handled in body)
+  p_sync_cursor text           -- null = leave unchanged (sentinel handled in body)
+) RETURNS void
+LANGUAGE plpgsql SECURITY DEFINER SET search_path = public
+AS $$
+DECLARE v_doc jsonb;
+BEGIN
+  PERFORM pg_advisory_xact_lock(hashtext(p_account_id::text));
+
+  -- Account must still be active inside this transaction, else skip (purge/disconnect raced)
+  IF NOT EXISTS (SELECT 1 FROM connected_accounts WHERE id = p_account_id AND status = 'active') THEN
+    RETURN;
+  END IF;
+
+  FOR v_doc IN SELECT * FROM jsonb_array_elements(p_documents)
+  LOOP
+    INSERT INTO documents (
+      connected_account_id, user_id, drive_file_id, name, mime_type,
+      web_view_link, size_bytes, drive_modified_time, text_content, content_status,
+      fetched_at, updated_at
+    )
+    SELECT
+      p_account_id,
+      (v_doc->>'user_id')::uuid,
+      v_doc->>'drive_file_id',
+      v_doc->>'name',
+      v_doc->>'mime_type',
+      v_doc->>'web_view_link',
+      NULLIF(v_doc->>'size_bytes','')::bigint,
+      NULLIF(v_doc->>'drive_modified_time','')::timestamptz,
+      v_doc->>'text_content',
+      v_doc->>'content_status',
+      now(), now()
+    ON CONFLICT (connected_account_id, drive_file_id) DO UPDATE SET
+      name = EXCLUDED.name,
+      mime_type = EXCLUDED.mime_type,
+      web_view_link = EXCLUDED.web_view_link,
+      size_bytes = EXCLUDED.size_bytes,
+      drive_modified_time = EXCLUDED.drive_modified_time,
+      text_content = EXCLUDED.text_content,
+      content_status = EXCLUDED.content_status,
+      updated_at = now();
+  END LOOP;
+
+  -- Cursor / backfill state writes, atomic with the upserts above.
+  -- Use a sentinel ('__unchanged__') so the collector can leave a column alone.
+  UPDATE connected_accounts SET
+    backfill_complete   = COALESCE(p_backfill_complete, backfill_complete),
+    backfill_page_token = CASE WHEN p_backfill_page_token = '__unchanged__' THEN backfill_page_token
+                               ELSE p_backfill_page_token END,
+    sync_cursor         = CASE WHEN p_sync_cursor = '__unchanged__' THEN sync_cursor
+                               ELSE p_sync_cursor END,
+    last_synced_at = now(),
+    updated_at = now()
+  WHERE id = p_account_id;
+END;
+$$;
+
+REVOKE ALL ON FUNCTION collect_account_documents(uuid, jsonb, boolean, text, text) FROM PUBLIC;
+REVOKE ALL ON FUNCTION collect_account_documents(uuid, jsonb, boolean, text, text) FROM anon;
+REVOKE ALL ON FUNCTION collect_account_documents(uuid, jsonb, boolean, text, text) FROM authenticated;
+GRANT EXECUTE ON FUNCTION collect_account_documents(uuid, jsonb, boolean, text, text) TO service_role;
+
+-- Locked deletion path for removed/trashed files
+CREATE OR REPLACE FUNCTION delete_account_documents(
+  p_account_id uuid,
+  p_file_ids text[]
+) RETURNS void
+LANGUAGE plpgsql SECURITY DEFINER SET search_path = public
+AS $$
+BEGIN
+  PERFORM pg_advisory_xact_lock(hashtext(p_account_id::text));
+  DELETE FROM documents
+    WHERE connected_account_id = p_account_id
+      AND drive_file_id = ANY(p_file_ids);
+END;
+$$;
+
+REVOKE ALL ON FUNCTION delete_account_documents(uuid, text[]) FROM PUBLIC;
+REVOKE ALL ON FUNCTION delete_account_documents(uuid, text[]) FROM anon;
+REVOKE ALL ON FUNCTION delete_account_documents(uuid, text[]) FROM authenticated;
+GRANT EXECUTE ON FUNCTION delete_account_documents(uuid, text[]) TO service_role;
+
+-- Purge-all + backfill reset under the lock, for the 410-Gone recovery path
+CREATE OR REPLACE FUNCTION reset_account_documents(p_account_id uuid)
+RETURNS void
+LANGUAGE plpgsql SECURITY DEFINER SET search_path = public
+AS $$
+BEGIN
+  PERFORM pg_advisory_xact_lock(hashtext(p_account_id::text));
+  DELETE FROM documents WHERE connected_account_id = p_account_id;
+  UPDATE connected_accounts
+    SET backfill_complete = false, sync_cursor = NULL, backfill_page_token = NULL, updated_at = now()
+    WHERE id = p_account_id;
+END;
+$$;
+
+REVOKE ALL ON FUNCTION reset_account_documents(uuid) FROM PUBLIC;
+REVOKE ALL ON FUNCTION reset_account_documents(uuid) FROM anon;
+REVOKE ALL ON FUNCTION reset_account_documents(uuid) FROM authenticated;
+GRANT EXECUTE ON FUNCTION reset_account_documents(uuid) TO service_role;
+```
+
+The collector passes `'__unchanged__'` for `p_backfill_page_token`/`p_sync_cursor` when a given write should not touch that column (e.g. an incremental page write leaves `backfill_page_token` alone).
+
+### Migration 4 — `drive_cron`
 
 ```sql
 DO $$
@@ -371,19 +485,22 @@ The Drive Changes start token must be captured *before* the first Files page so 
      &fields=nextPageToken,files(id,name,mimeType,webViewLink,size,modifiedTime)
      &pageSize=25            (DRIVE_PAGE_SIZE — whole-page processing fits wall-clock)
      &pageToken=<backfill_page_token if set>
-     &corpora=user            (personal Drive only; excludes Shared Drives)
+     &corpora=user            (owned + shared-with-me; Shared/Team Drives excluded — neither
+                               includeItemsFromAllDrives nor supportsAllDrives is set)
 
-   For each file in the page: classify MIME type → extract or mark → upsert to documents
-     ON CONFLICT (connected_account_id, drive_file_id) DO UPDATE
-   (process the WHOLE page before checkpointing)
+   On 400 with reason 'invalidValue'/'pageTokenInvalid' (expired files.list page token, Codex v3):
+     clear backfill_page_token = null and restart backfill pagination from page 1 next run; break
 
-   After the page, re-check status='active', then:
+   For each file in the page: classify MIME type → extract or mark → build doc row
+   (process the WHOLE page; collect rows into a pageDocs[] array)
+
+   Persist the page ATOMICALLY via the RPC (re-checks status='active' under advisory lock):
      If response has nextPageToken:
-       persist backfill_page_token = nextPageToken
+       collect_account_documents(account.id, pageDocs, NULL, nextPageToken, '__unchanged__')
        if pages-this-run >= MAX_PAGES_PER_RUN: stop (resume next tick); else continue loop
      Else (final page):
-       persist backfill_complete = true, backfill_page_token = null
-       (sync_cursor already holds the pre-backfill start token from step 1 — do NOT overwrite it)
+       collect_account_documents(account.id, pageDocs, true /*backfill_complete*/, NULL, '__unchanged__')
+       (sync_cursor already holds the pre-backfill start token from step 1 — pass '__unchanged__')
        break
 ```
 
@@ -402,34 +519,30 @@ loop:
     &fields=nextPageToken,newStartPageToken,changes(fileId,removed,file(id,name,mimeType,webViewLink,size,modifiedTime,trashed))
     &pageSize=25            (DRIVE_PAGE_SIZE)
     &includeRemoved=true
-    &restrictToMyDrive=true        (personal Drive only)
-    # note: file(...,trashed) is in the mask — Drive omits trashed unless requested (Codex v2 #4)
+    # corpus aligned with backfill: do NOT set restrictToMyDrive — changes then covers the
+    # same owned + shared-with-me set that files.list corpora=user returns, so shared-with-me
+    # rows don't go stale (Codex v3). Shared/Team Drives excluded in both (no allDrives flags).
+    # file(...,trashed) is in the mask — Drive omits trashed unless requested (Codex v2 #4)
 
   On 410 Gone (token expired): the cursor is unrecoverable and we may have missed deletions.
-    Purge the account's documents and re-enter a clean backfill (Codex v2 #3):
-      DELETE FROM documents WHERE connected_account_id = account.id
-      UPDATE: backfill_complete=false, sync_cursor=null, backfill_page_token=null
+    reset_account_documents(account.id)   # locked: purges docs + resets backfill state (Codex v2 #3, v3)
     then break (next run rebuilds from scratch; pre-backfill start token re-captured fresh)
 
-  Process the WHOLE page:
-    For each change:
-      - If change.removed === true OR change.file?.trashed === true:
-          DELETE FROM documents WHERE drive_file_id = change.fileId AND connected_account_id = account.id
-      - Else if change.file:
-          classify + upsert
+  Process the WHOLE page; partition changes into:
+    - removedIds[]  ← changes where removed === true OR file.trashed === true (collect change.fileId)
+    - upsertDocs[]  ← changes with a live file (classify + build row)
 
-  re-check status='active'
-  If response.nextPageToken:
-    pageToken = response.nextPageToken
-    persist sync_cursor = pageToken     # nextPageToken is a valid resume pageToken
-    pagesThisRun++
-    if pagesThisRun >= MAX_PAGES_PER_RUN: break   # resume next tick from sync_cursor
-    continue
-  Else:
-    persist sync_cursor = response.newStartPageToken  # final page only
-    break
-
-UPDATE last_synced_at = now() at the end.
+  Persist the page atomically:
+    if removedIds: delete_account_documents(account.id, removedIds)   # locked
+    If response.nextPageToken:
+      pageToken = response.nextPageToken
+      collect_account_documents(account.id, upsertDocs, NULL, '__unchanged__', pageToken)  # cursor = next page token
+      pagesThisRun++
+      if pagesThisRun >= MAX_PAGES_PER_RUN: break
+      continue
+    Else:
+      collect_account_documents(account.id, upsertDocs, NULL, '__unchanged__', response.newStartPageToken)
+      break
 ```
 
 Checkpointing is page-aligned: `sync_cursor` always holds a valid `pageToken` (either the next `nextPageToken` or the terminal `newStartPageToken`). Capping at `MAX_PAGES_PER_RUN` is safe because we only ever persist a token after a whole page is applied.
@@ -516,20 +629,28 @@ This removes the mid-page-skip/reprocess-forever hazard: a persisted token alway
 ```typescript
 async function readBounded(res: Response, maxBytes = 500_000): Promise<string> {
   const reader = res.body?.getReader()
-  if (!reader) return (await res.text()).slice(0, maxBytes)
+  if (!reader) {
+    // No stream reader available — read as ArrayBuffer and hard-cap the BYTES before decode,
+    // never the post-decode string (avoids buffering an unbounded body via res.text()).
+    const buf = new Uint8Array(await res.arrayBuffer())
+    return new TextDecoder().decode(buf.subarray(0, maxBytes))
+  }
   const chunks: Uint8Array[] = []
   let total = 0
   while (total < maxBytes) {
     const { done, value } = await reader.read()
     if (done) break
-    chunks.push(value); total += value.length
+    // Trim this chunk so the accumulated total never exceeds maxBytes
+    const remaining = maxBytes - total
+    const slice = value.length > remaining ? value.subarray(0, remaining) : value
+    chunks.push(slice); total += slice.length
   }
   await reader.cancel()  // stop downloading once we have enough
-  return new TextDecoder().decode(concat(chunks)).slice(0, maxBytes)
+  return new TextDecoder().decode(concat(chunks))
 }
 ```
 
-Unit-test this helper (Codex v2 #7): asserts it stops at the cap and cancels the stream.
+The byte cap is enforced *before* accumulation, so memory never exceeds `maxBytes` regardless of chunk sizes, and the fallback path reads an `ArrayBuffer` capped at decode time rather than buffering an unbounded string. Unit-test (Codex v2 #7): asserts it stops at the cap, trims an oversized final chunk, and cancels the stream.
 
 **Upsert to `documents`:**
 
@@ -710,6 +831,9 @@ The Deno edge functions can't run under Jest directly, but the **pure classifica
 - `authenticated` role cannot INSERT/UPDATE/DELETE `documents` (RLS write denial); can only SELECT own rows.
 - `lifecycle_disconnect(..., p_purge=true)` deletes the account's documents; `p_purge=false` leaves them.
 - `lifecycle_delete` cascade-deletes documents via the composite FK ON DELETE CASCADE.
+- `collect_account_documents` skips all writes when the account is not `active` (purge-race no-op) and upserts + advances cursor when active.
+- `delete_account_documents` removes only the listed file ids for the account; `reset_account_documents` purges all docs and resets backfill state.
+- All three new RPCs are not executable by `anon`/`authenticated` (grant test), only `service_role`.
 
 These run as SQL assertions against the linked project (or a migration-test harness), consistent with how the team verifies RLS.
 
@@ -722,12 +846,13 @@ Corrected so that nothing can run against a half-deployed state (Codex v1 #2, #5
 1. **Deploy `gmail-collector` (modified)** — adds `.eq('provider', 'google')`. Must land before any Drive account can exist, so the Gmail collector never grabs a Drive token. (Codex v1 #2)
 2. **Migration 1** — `documents_table` (composite FK, RLS, indexes) → confirm Remote → `npm run gen:types`, commit types in the same commit.
 3. **Migration 2** — `lifecycle_rpcs_v5` (purge documents) → confirm Remote.
-4. **Deploy `google-oauth-callback` (modified)** — provider whitelist, scope map, redirect whitelist. Backward-compatible (defaults to `'google'` / `/accounts`).
-5. **Deploy `google-drive-oauth-initiate` (new).**
-6. **Deploy `google-drive-collector` (new).**
-7. **Smoke-test the collector manually:** invoke `google-drive-collector` once with the `CRON_SECRET` bearer (no Drive account connected yet → expect `{processed:0, errors:0, accounts:0}`; then connect one Drive account and invoke again → expect it to begin backfill). Confirm no errors in logs.
-8. **Migration 3** — `drive_cron` (schedule every 5 min) → confirm Remote. Scheduled only now that the collector is proven.
-9. **Frontend** build + deploy (Connect Drive button, `/documents` route).
+4. **Migration 3** — `documents_collect_rpc` (`collect_account_documents`, `delete_account_documents`, `reset_account_documents`) → confirm Remote → `npm run gen:types`, commit types.
+5. **Deploy `google-oauth-callback` (modified)** — provider whitelist, scope map, redirect whitelist. Backward-compatible (defaults to `'google'` / `/accounts`).
+6. **Deploy `google-drive-oauth-initiate` (new).**
+7. **Deploy `google-drive-collector` (new)** — calls the collect/delete/reset RPCs.
+8. **Smoke-test the collector manually:** invoke `google-drive-collector` once with the `CRON_SECRET` bearer (no Drive account connected yet → expect `{processed:0, errors:0, accounts:0}`; then connect one Drive account and invoke again → expect it to begin backfill). Confirm no errors in logs.
+9. **Migration 4** — `drive_cron` (schedule every 5 min) → confirm Remote. Scheduled only now that the collector is proven.
+10. **Frontend** build + deploy (Connect Drive button, `/documents` route).
 
 ## Rollback runbook (Codex v1 #12)
 
@@ -749,6 +874,7 @@ If Epic 04 misbehaves in the demo environment, back out in this order without de
 | EU-04-0 | gmail-collector: add `.eq('provider','google')` | CRITICAL, deploy first (Codex #2) |
 | EU-04-1 | Migration: documents table | Composite FK, RLS, modified-time indexes, idempotent (Codex #1, #8) |
 | EU-04-2 | Migration: lifecycle_rpcs_v5 | Extend disconnect purge to documents |
+| EU-04-2b | Migration: documents_collect_rpc | Advisory-locked collect/delete/reset RPCs (Codex v3 critical) |
 | EU-04-3 | Migration: drive_cron | pg_cron job — scheduled LAST after collector smoke test (Codex #5) |
 | EU-04-4 | types/provider.ts: add google_drive | Small frontend change |
 | EU-04-5 | google-drive-oauth-initiate edge function | New, mirrors google-oauth-initiate, reconnect support |
