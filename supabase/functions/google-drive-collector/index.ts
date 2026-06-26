@@ -261,6 +261,7 @@ async function persistPage(
   backfillComplete: boolean | null,
   backfillPageToken: string,
   syncCursor: string,
+  expectedVersion: number,
 ): Promise<boolean> {
   const batches = chunk(docs, RPC_DOC_BATCH)
   if (batches.length === 0) {
@@ -271,6 +272,7 @@ async function persistPage(
       p_backfill_complete: backfillComplete,
       p_backfill_page_token: backfillPageToken,
       p_sync_cursor: syncCursor,
+      p_expected_version: expectedVersion,
     })
     return !error
   }
@@ -282,6 +284,7 @@ async function persistPage(
       p_backfill_complete: isFinal ? backfillComplete : null,
       p_backfill_page_token: isFinal ? backfillPageToken : UNCHANGED,
       p_sync_cursor: isFinal ? syncCursor : UNCHANGED,
+      p_expected_version: expectedVersion,
     })
     if (error) return false // cursor not advanced; page retried next run (upserts idempotent)
   }
@@ -359,7 +362,7 @@ Deno.serve(async (req: Request) => {
           const startData = await startRes.json() as { startPageToken?: string }
           if (!startData.startPageToken) { errors++; continue }
           // Persist the start token immediately (cursor-only write).
-          const ok = await persistPage(supabaseAdmin, account.id, [], null, UNCHANGED, startData.startPageToken)
+          const ok = await persistPage(supabaseAdmin, account.id, [], null, UNCHANGED, startData.startPageToken, account.lifecycle_version)
           if (!ok) { errors++; continue }
           account.sync_cursor = startData.startPageToken
         }
@@ -383,7 +386,7 @@ Deno.serve(async (req: Request) => {
 
           if (res.status === 400) {
             // Expired files.list page token — clear it and restart pagination next run.
-            const ok = await persistPage(supabaseAdmin, account.id, [], null, '', UNCHANGED)
+            const ok = await persistPage(supabaseAdmin, account.id, [], null, '', UNCHANGED, account.lifecycle_version)
             if (!ok) errors++
             aborted = true
             break
@@ -406,7 +409,7 @@ Deno.serve(async (req: Request) => {
 
           if (listData.nextPageToken) {
             // More pages: advance backfill_page_token, leave sync_cursor (holds start token).
-            const ok = await persistPage(supabaseAdmin, account.id, pageDocs, null, listData.nextPageToken, UNCHANGED)
+            const ok = await persistPage(supabaseAdmin, account.id, pageDocs, null, listData.nextPageToken, UNCHANGED, account.lifecycle_version)
             if (!ok) { errors++; aborted = true; break }
             processed += pageDocs.length
             pageToken = listData.nextPageToken
@@ -414,7 +417,7 @@ Deno.serve(async (req: Request) => {
           } else {
             // Final page: backfill complete. Clear page token; sync_cursor already holds the
             // pre-backfill start token, so leave it unchanged.
-            const ok = await persistPage(supabaseAdmin, account.id, pageDocs, true, '', UNCHANGED)
+            const ok = await persistPage(supabaseAdmin, account.id, pageDocs, true, '', UNCHANGED, account.lifecycle_version)
             if (!ok) { errors++; aborted = true; break }
             processed += pageDocs.length
             aborted = true // done; exit loop
@@ -445,7 +448,7 @@ Deno.serve(async (req: Request) => {
             // Cursor unrecoverable and we may have missed deletions — full reset (locked).
             // If the reset RPC fails, count it and leave state untouched so the next run
             // retries (cursor is not advanced).
-            const { error: resetErr } = await supabaseAdmin.rpc('reset_account_documents', { p_account_id: account.id })
+            const { error: resetErr } = await supabaseAdmin.rpc('reset_account_documents', { p_account_id: account.id, p_expected_version: account.lifecycle_version })
             if (resetErr) errors++
             break
           }
@@ -474,6 +477,7 @@ Deno.serve(async (req: Request) => {
             const { error: delErr } = await supabaseAdmin.rpc('delete_account_documents', {
               p_account_id: account.id,
               p_file_ids: removedIds,
+              p_expected_version: account.lifecycle_version,
             })
             if (delErr) { errors++; break }  // do NOT advance cursor; retry this page next run
           }
@@ -489,7 +493,7 @@ Deno.serve(async (req: Request) => {
           }
 
           if (data.nextPageToken) {
-            const ok = await persistPage(supabaseAdmin, account.id, upsertDocs, null, UNCHANGED, data.nextPageToken)
+            const ok = await persistPage(supabaseAdmin, account.id, upsertDocs, null, UNCHANGED, data.nextPageToken, account.lifecycle_version)
             if (!ok) { errors++; break }
             processed += upsertDocs.length
             pageToken = data.nextPageToken
@@ -497,7 +501,7 @@ Deno.serve(async (req: Request) => {
             if (pagesThisRun >= MAX_PAGES_PER_RUN) break
           } else {
             const terminal = data.newStartPageToken ?? pageToken
-            const ok = await persistPage(supabaseAdmin, account.id, upsertDocs, null, UNCHANGED, terminal)
+            const ok = await persistPage(supabaseAdmin, account.id, upsertDocs, null, UNCHANGED, terminal, account.lifecycle_version)
             if (!ok) { errors++; break }
             processed += upsertDocs.length
             break

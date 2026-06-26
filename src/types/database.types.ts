@@ -219,6 +219,7 @@ export type Database = {
           p_backfill_complete: boolean
           p_backfill_page_token: string
           p_documents: Json
+          p_expected_version: number
           p_sync_cursor: string
         }
         Returns: undefined
@@ -228,7 +229,11 @@ export type Database = {
         Returns: undefined
       }
       delete_account_documents: {
-        Args: { p_account_id: string; p_file_ids: string[] }
+        Args: {
+          p_account_id: string
+          p_expected_version: number
+          p_file_ids: string[]
+        }
         Returns: undefined
       }
       get_vault_secret: { Args: { secret_name: string }; Returns: string }
@@ -251,7 +256,7 @@ export type Database = {
         Returns: boolean
       }
       reset_account_documents: {
-        Args: { p_account_id: string }
+        Args: { p_account_id: string; p_expected_version: number }
         Returns: undefined
       }
       vault_create_secret: {
