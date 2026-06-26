@@ -83,7 +83,7 @@ describe('DocumentsPage', () => {
     expect(screen.getByText('hello body')).toBeInTheDocument()
   })
 
-  it('shows the pending message for needs_processing documents', () => {
+  it('shows the processing message for needs_processing documents', () => {
     mockUseDocument.mockReturnValue({
       data: {
         id: 'd2', name: 'big.docx', mime_type: 'application/pdf', content_status: 'needs_processing',
@@ -92,7 +92,7 @@ describe('DocumentsPage', () => {
       isLoading: false,
     })
     renderPage()
-    expect(screen.getByText(/content extraction pending/i)).toBeInTheDocument()
+    expect(screen.getByText(/processing/i)).toBeInTheDocument()
   })
 
   it('renders html-source text_content as plain text, NOT as markup', () => {

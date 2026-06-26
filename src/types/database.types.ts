@@ -208,6 +208,55 @@ export type Database = {
         }
         Relationships: []
       }
+      // EU-05-9 (HAND-AUGMENTED, regenerate from remote after Migration 3 applied):
+      // processing_jobs table types. Replace with `npm run gen:types` output post-deploy.
+      processing_jobs: {
+        Row: {
+          attempts: number
+          claimed_at: string | null
+          created_at: string
+          document_id: string
+          id: string
+          last_error: string | null
+          source_type: string
+          status: string
+          updated_at: string
+          user_id: string
+        }
+        Insert: {
+          attempts?: number
+          claimed_at?: string | null
+          created_at?: string
+          document_id: string
+          id?: string
+          last_error?: string | null
+          source_type?: string
+          status?: string
+          updated_at?: string
+          user_id: string
+        }
+        Update: {
+          attempts?: number
+          claimed_at?: string | null
+          created_at?: string
+          document_id?: string
+          id?: string
+          last_error?: string | null
+          source_type?: string
+          status?: string
+          updated_at?: string
+          user_id?: string
+        }
+        Relationships: [
+          {
+            foreignKeyName: "processing_jobs_user_document_fk"
+            columns: ["user_id", "document_id"]
+            isOneToOne: false
+            referencedRelation: "documents"
+            referencedColumns: ["user_id", "id"]
+          },
+        ]
+      }
     }
     Views: {
       [_ in never]: never
@@ -226,6 +275,45 @@ export type Database = {
       }
       collect_account_messages: {
         Args: { p_account_id: string; p_messages: Json; p_new_cursor: string }
+        Returns: undefined
+      }
+      // EU-05-9 (HAND-AUGMENTED, regenerate from remote after Migration 4 applied):
+      // processing_jobs RPC signatures. Replace with `npm run gen:types` output post-deploy.
+      claim_processing_jobs: {
+        Args: {
+          p_limit: number
+          p_max_attempts: number
+          p_stale_seconds: number
+        }
+        Returns: {
+          job_id: string
+          document_id: string
+          user_id: string
+          attempts: number
+          claimed_at: string
+          drive_file_id: string
+          mime_type: string
+          connected_account_id: string
+          lifecycle_version: number
+          drive_modified_time: string | null
+        }[]
+      }
+      complete_processing_job: {
+        Args: {
+          p_job_id: string
+          p_claimed_at: string
+          p_attempts: number
+          p_lifecycle_version: number
+          p_drive_modified_time: string | null
+          p_outcome: string
+          p_text: string | null
+          p_error: string | null
+          p_max_attempts: number
+        }
+        Returns: undefined
+      }
+      enqueue_processing_jobs: {
+        Args: Record<PropertyKey, never>
         Returns: undefined
       }
       delete_account_documents: {

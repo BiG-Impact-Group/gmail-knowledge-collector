@@ -26,7 +26,7 @@ function formatSize(bytes: number | null): string {
 }
 
 const STATUS_MESSAGES: Record<string, string> = {
-  needs_processing: 'Content extraction pending (Epic 05).',
+  needs_processing: 'Processing…',
   needs_ocr: 'OCR required — this file contains scanned content.',
   skipped: 'Content not available for this file type.',
 }
