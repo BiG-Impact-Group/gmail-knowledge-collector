@@ -39,6 +39,12 @@ export default [
         Promise: 'readonly',
         URL: 'readonly',
         URLSearchParams: 'readonly',
+        fetch: 'readonly',
+        Response: 'readonly',
+        Headers: 'readonly',
+        TextEncoder: 'readonly',
+        TextDecoder: 'readonly',
+        Uint8Array: 'readonly',
       },
     },
     plugins: {
@@ -60,7 +66,11 @@ export default [
   {
     files: ['src/**/*.test.{ts,tsx}', 'src/test/**/*.{ts,tsx}'],
     languageOptions: {
-      globals: jestGlobals,
+      globals: {
+        ...jestGlobals,
+        __dirname: 'readonly',
+        require: 'readonly',
+      },
     },
   },
 ]

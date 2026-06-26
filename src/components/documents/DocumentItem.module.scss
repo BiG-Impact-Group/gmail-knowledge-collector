@@ -1,0 +1,67 @@
+@use '@/styles/tokens' as *;
+
+.item {
+  display: grid;
+  grid-template-columns: 1fr auto;
+  grid-template-rows: auto auto;
+  gap: 2px $spacing-sm;
+  width: 100%;
+  padding: $spacing-sm $spacing-md;
+  background: transparent;
+  border: none;
+  border-bottom: 1px solid $color-border;
+  text-align: left;
+  cursor: pointer;
+  transition: background $transition-fast;
+
+  &:hover {
+    background: $color-surface-alt;
+  }
+
+  &.selected {
+    background: #e8f0fe;
+  }
+}
+
+.name {
+  font-weight: 600;
+  font-size: $font-size-base;
+  color: $color-text-primary;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.date {
+  font-size: $font-size-sm;
+  color: $color-text-secondary;
+  white-space: nowrap;
+}
+
+.type {
+  grid-column: 1 / -1;
+  display: flex;
+  align-items: center;
+  gap: $spacing-sm;
+  font-size: $font-size-sm;
+  color: $color-text-secondary;
+}
+
+.badge {
+  padding: 0 $spacing-xs;
+  border-radius: $border-radius-sm;
+  background: rgba($color-warning, 0.15);
+  color: $color-warning;
+  font-size: $font-size-sm;
+  font-weight: 500;
+}
+
+.account {
+  grid-column: 1 / -1;
+  font-size: $font-size-sm;
+  color: $color-primary;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  opacity: 0.75;
+}

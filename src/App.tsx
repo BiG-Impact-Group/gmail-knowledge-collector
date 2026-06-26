@@ -6,6 +6,7 @@ import LoginPage from '@/components/auth/LoginPage'
 
 const AccountsPage = lazy(() => import('@/components/accounts/AccountsPage'))
 const EmailPage = lazy(() => import('@/components/email/EmailPage'))
+const DocumentsPage = lazy(() => import('@/components/documents/DocumentsPage'))
 
 function ProtectedRoute({ children }: { children: React.ReactNode }) {
   const [session, setSession] = useState<Session | null | undefined>(undefined)
@@ -33,6 +34,9 @@ export default function App() {
         } />
         <Route path="/emails" element={
           <ProtectedRoute><EmailPage /></ProtectedRoute>
+        } />
+        <Route path="/documents" element={
+          <ProtectedRoute><DocumentsPage /></ProtectedRoute>
         } />
         <Route path="/" element={<Navigate to="/accounts" replace />} />
       </Routes>

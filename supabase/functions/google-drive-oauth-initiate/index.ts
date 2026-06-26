@@ -1,10 +1,7 @@
-// CONNECTOR SEAM: This function initiates the OAuth flow for Google.
-// A second connector (e.g. Microsoft, Slack) would:
-//   1. Define its own AUTH_URL, SCOPES, and REDIRECT_URI
-//   2. Implement its own state signing or PKCE mechanism
-//   3. Deploy as a separate edge function (e.g. microsoft-oauth-initiate)
-// The browser calls accounts.service.ts → initiateOAuth(provider) which routes to the correct function.
-// See src/types/connector.ts for the ConnectorConfig interface shape.
+// CONNECTOR SEAM: This function initiates the OAuth flow for Google Drive.
+// Symmetric with google-oauth-initiate (Gmail) but requests the drive.readonly scope and
+// embeds provider='google_drive' + redirect_path='/documents' in the signed state JWT.
+// The shared google-oauth-callback handles the token exchange and uses statePayload.provider.
 
 import { createClient } from 'https://esm.sh/@supabase/supabase-js@2'
 
@@ -12,7 +9,7 @@ const GOOGLE_AUTH_URL = 'https://accounts.google.com/o/oauth2/v2/auth'
 const SCOPES = [
   'openid',
   'email',
-  'https://www.googleapis.com/auth/gmail.readonly',
+  'https://www.googleapis.com/auth/drive.readonly',
 ].join(' ')
 const REDIRECT_URI = 'https://ybgtzyutbvwfhgtlmnah.supabase.co/functions/v1/google-oauth-callback'
 
@@ -26,7 +23,8 @@ interface StatePayloadInput {
   nonce: string
   exp: number
   reconnect_account_id?: string
-  provider?: string
+  provider: string
+  redirect_path: string
   expected_lifecycle_version?: number
 }
 
@@ -91,9 +89,9 @@ Deno.serve(async (req: Request) => {
     // No body or invalid JSON — treat as new connection
   }
 
-  // If reconnect, verify account ownership before issuing redirect and capture the
-  // lifecycle_version NOW so the callback can detect a disconnect/delete that happens
-  // between this initiation and the callback (signed into state, tamper-proof).
+  // If reconnect, verify account ownership AND that it is a Drive account before issuing redirect
+  // Capture lifecycle_version at initiation (signed into state) so the callback can detect a
+  // disconnect/delete that happens between this initiation and the callback.
   let expectedLifecycleVersion: number | undefined
   if (reconnectAccountId) {
     const supabaseAdmin = createClient(supabaseUrl, serviceRoleKey)
@@ -104,7 +102,7 @@ Deno.serve(async (req: Request) => {
       .eq('user_id', user.id)
       .single()
 
-    if (fetchErr || !account) {
+    if (fetchErr || !account || account.provider !== 'google_drive') {
       return Response.json({ error: 'Account not found or not owned by this user' }, { status: 404, headers: corsHeaders })
     }
     expectedLifecycleVersion = account.lifecycle_version
@@ -115,8 +113,10 @@ Deno.serve(async (req: Request) => {
     user_id: user.id,
     nonce,
     exp: Math.floor(Date.now() / 1000) + 300,
+    provider: 'google_drive',
+    redirect_path: '/documents',
     ...(reconnectAccountId
-      ? { reconnect_account_id: reconnectAccountId, provider: 'google', expected_lifecycle_version: expectedLifecycleVersion }
+      ? { reconnect_account_id: reconnectAccountId, expected_lifecycle_version: expectedLifecycleVersion }
       : {}),
   }
   const state = await buildStateJwt(statePayload, stateSecret)

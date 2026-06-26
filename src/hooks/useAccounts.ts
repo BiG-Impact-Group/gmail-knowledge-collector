@@ -1,5 +1,5 @@
-import { useQuery, keepPreviousData } from '@tanstack/react-query'
-import { getAccounts } from '@/services/accounts.service'
+import { useQuery, useMutation, useQueryClient, keepPreviousData } from '@tanstack/react-query'
+import { getAccounts, disconnectAccount, deleteAccount } from '@/services/accounts.service'
 
 export function useAccounts() {
   return useQuery({
@@ -7,5 +7,33 @@ export function useAccounts() {
     queryFn: getAccounts,
     staleTime: 5 * 60_000,
     placeholderData: keepPreviousData,
+  })
+}
+
+/** Invalidates and removes accounts, messages, and individual message caches after disconnect/delete */
+function useAccountsInvalidation() {
+  const queryClient = useQueryClient()
+  return () => {
+    queryClient.invalidateQueries({ queryKey: ['accounts'] })
+    // Remove (not just invalidate) cached messages so purged PII is not visible until refetch
+    queryClient.removeQueries({ queryKey: ['messages'] })
+    queryClient.removeQueries({ queryKey: ['message'] })
+  }
+}
+
+export function useDisconnectAccount() {
+  const invalidate = useAccountsInvalidation()
+  return useMutation({
+    mutationFn: ({ accountId, purgeMessages }: { accountId: string; purgeMessages: boolean }) =>
+      disconnectAccount(accountId, purgeMessages),
+    onSuccess: invalidate,
+  })
+}
+
+export function useDeleteAccount() {
+  const invalidate = useAccountsInvalidation()
+  return useMutation({
+    mutationFn: ({ accountId }: { accountId: string }) => deleteAccount(accountId),
+    onSuccess: invalidate,
   })
 }

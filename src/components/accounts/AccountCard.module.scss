@@ -28,6 +28,10 @@
   color: $color-text-primary;
 }
 
+.providerIcon {
+  margin-right: $spacing-xs;
+}
+
 .provider {
   font-size: $font-size-sm;
   color: $color-text-secondary;
@@ -60,6 +64,7 @@
   display: flex;
   align-items: center;
   justify-content: space-between;
+  gap: $spacing-sm;
 }
 
 .synced {
@@ -67,11 +72,49 @@
   color: $color-text-secondary;
 }
 
+.actions {
+  display: flex;
+  gap: $spacing-xs;
+  flex-wrap: wrap;
+}
+
 .reconnect {
   padding: $spacing-xs $spacing-sm;
   background: $color-error;
   color: white;
   border: none;
+  border-radius: $border-radius-sm;
+  font-size: $font-size-sm;
+  font-weight: 500;
+  cursor: pointer;
+  transition: opacity $transition-fast;
+
+  &:hover {
+    opacity: 0.85;
+  }
+}
+
+.disconnect {
+  padding: $spacing-xs $spacing-sm;
+  background: transparent;
+  color: $color-text-secondary;
+  border: 1px solid $color-border;
+  border-radius: $border-radius-sm;
+  font-size: $font-size-sm;
+  font-weight: 500;
+  cursor: pointer;
+  transition: opacity $transition-fast;
+
+  &:hover {
+    opacity: 0.85;
+  }
+}
+
+.delete {
+  padding: $spacing-xs $spacing-sm;
+  background: transparent;
+  color: $color-error;
+  border: 1px solid $color-error;
   border-radius: $border-radius-sm;
   font-size: $font-size-sm;
   font-weight: 500;
