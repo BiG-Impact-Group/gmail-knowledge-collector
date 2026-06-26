@@ -214,14 +214,14 @@ Deno.serve(async (req: Request) => {
         }
         messageIds = (listData.messages ?? []).map(m => m.id)
 
-        // Process messages for this page
+        // Collect messages for this page into an array for the RPC
+        const pageMsgs: unknown[] = []
         for (const msgId of messageIds) {
           try {
             const msg = await fetchFullMessage(accessToken, msgId)
             const headers = msg.payload?.headers
             const { text, html } = extractBody(msg.payload)
-            await supabaseAdmin.from('messages').upsert({
-              connected_account_id: account.id,
+            pageMsgs.push({
               user_id: account.user_id,
               gmail_message_id: msg.id,
               thread_id: msg.threadId ?? null,
@@ -235,16 +235,35 @@ Deno.serve(async (req: Request) => {
               body_text: text,
               body_html: html,
               label_ids: msg.labelIds ?? null,
-            }, { onConflict: 'connected_account_id,gmail_message_id', ignoreDuplicates: true })
-            processed++
+            })
           } catch {
-            // Skip individual message failures; don't abort the page
+            // Skip individual message fetch failures; don't abort the page
           }
         }
 
         if (isBackfillComplete(listData.nextPageToken)) {
-          // Final page — backfill done. Set sync_cursor to the historyId captured
-          // before page 1 so the History API covers the entire backfill window.
+          // Final page — backfill done. Use collect_account_messages RPC for atomic
+          // message upsert + sync_cursor update, then update backfill state separately.
+          if (pageMsgs.length > 0) {
+            const { error: rpcErr } = await supabaseAdmin
+              .rpc('collect_account_messages', {
+                p_account_id: account.id,
+                p_messages: pageMsgs,
+                p_new_cursor: startHistoryId,
+              })
+            if (rpcErr) { errors++; continue }
+          }
+          processed += pageMsgs.length
+          // Re-check status before writing cursor — disconnect/delete may have completed
+          const { data: statusCheck } = await supabaseAdmin
+            .from('connected_accounts')
+            .select('status')
+            .eq('id', account.id)
+            .single()
+          if (statusCheck?.status !== 'active') {
+            console.warn(`Account ${account.id} no longer active before backfill-complete update — skipping`)
+            continue
+          }
           const { error: updateErr } = await supabaseAdmin
             .from('connected_accounts')
             .update({
@@ -258,7 +277,28 @@ Deno.serve(async (req: Request) => {
             .eq('id', account.id)
           if (updateErr) { errors++; continue }
         } else {
-          // More pages — persist backfill_start_history_id atomically with page token
+          // More pages — upsert messages atomically, then persist page state.
+          if (pageMsgs.length > 0) {
+            const { error: rpcErr } = await supabaseAdmin
+              .rpc('collect_account_messages', {
+                p_account_id: account.id,
+                p_messages: pageMsgs,
+                p_new_cursor: account.sync_cursor,
+              })
+            if (rpcErr) { errors++; continue }
+          }
+          processed += pageMsgs.length
+          // Re-check status before writing page state — disconnect/delete may have completed
+          const { data: statusCheck } = await supabaseAdmin
+            .from('connected_accounts')
+            .select('status')
+            .eq('id', account.id)
+            .single()
+          if (statusCheck?.status !== 'active') {
+            console.warn(`Account ${account.id} no longer active before page-token update — skipping`)
+            continue
+          }
+          // Persist backfill_start_history_id atomically with page token
           // so the next run sees a consistent (startHistoryId, pageToken) pair.
           const { error: updateErr } = await supabaseAdmin
             .from('connected_accounts')
@@ -304,13 +344,14 @@ Deno.serve(async (req: Request) => {
           .flatMap(h => h.messagesAdded ?? [])
           .map(m => m.message.id)
 
+        // Collect incremental messages and write atomically via RPC
+        const incrMsgs: unknown[] = []
         for (const msgId of messageIds) {
           try {
             const msg = await fetchFullMessage(accessToken, msgId)
             const headers = msg.payload?.headers
             const { text, html } = extractBody(msg.payload)
-            await supabaseAdmin.from('messages').upsert({
-              connected_account_id: account.id,
+            incrMsgs.push({
               user_id: account.user_id,
               gmail_message_id: msg.id,
               thread_id: msg.threadId ?? null,
@@ -324,21 +365,22 @@ Deno.serve(async (req: Request) => {
               body_text: text,
               body_html: html,
               label_ids: msg.labelIds ?? null,
-            }, { onConflict: 'connected_account_id,gmail_message_id', ignoreDuplicates: true })
-            processed++
+            })
           } catch {
-            // Skip individual message failures
+            // Skip individual message fetch failures
           }
         }
 
-        await supabaseAdmin
-          .from('connected_accounts')
-          .update({
-            sync_cursor: newCursor,
-            last_synced_at: new Date().toISOString(),
-            updated_at: new Date().toISOString(),
+        // collect_account_messages RPC handles both message upsert and cursor update atomically
+        // It re-checks account status inside the transaction (advisory lock prevents purge race)
+        const { error: rpcErr } = await supabaseAdmin
+          .rpc('collect_account_messages', {
+            p_account_id: account.id,
+            p_messages: incrMsgs,
+            p_new_cursor: newCursor,
           })
-          .eq('id', account.id)
+        if (rpcErr) { errors++; continue }
+        processed += incrMsgs.length
       }
 
     } catch {

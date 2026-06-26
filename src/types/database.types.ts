@@ -24,6 +24,7 @@ export type Database = {
           granted_scopes: string | null
           id: string
           last_synced_at: string | null
+          lifecycle_version: number
           provider: string
           status: string
           sync_cursor: string | null
@@ -39,6 +40,7 @@ export type Database = {
           granted_scopes?: string | null
           id?: string
           last_synced_at?: string | null
+          lifecycle_version?: number
           provider?: string
           status?: string
           sync_cursor?: string | null
@@ -54,6 +56,7 @@ export type Database = {
           granted_scopes?: string | null
           id?: string
           last_synced_at?: string | null
+          lifecycle_version?: number
           provider?: string
           status?: string
           sync_cursor?: string | null
@@ -119,14 +122,70 @@ export type Database = {
             referencedRelation: "connected_accounts"
             referencedColumns: ["id"]
           },
+          {
+            foreignKeyName: "messages_user_id_connected_account_fk"
+            columns: ["user_id", "connected_account_id"]
+            isOneToOne: false
+            referencedRelation: "connected_accounts"
+            referencedColumns: ["user_id", "id"]
+          },
         ]
+      }
+      oauth_nonces: {
+        Row: {
+          expires_at: string
+          nonce: string
+          user_id: string
+        }
+        Insert: {
+          expires_at: string
+          nonce: string
+          user_id: string
+        }
+        Update: {
+          expires_at?: string
+          nonce?: string
+          user_id?: string
+        }
+        Relationships: []
       }
     }
     Views: {
       [_ in never]: never
     }
     Functions: {
-      [_ in never]: never
+      collect_account_messages: {
+        Args: { p_account_id: string; p_messages: Json; p_new_cursor: string }
+        Returns: undefined
+      }
+      get_vault_secret: { Args: { secret_name: string }; Returns: string }
+      get_vault_secret_id: { Args: { secret_name: string }; Returns: string }
+      lifecycle_delete: {
+        Args: {
+          p_account_id: string
+          p_expected_version: number
+          p_user_id: string
+        }
+        Returns: boolean
+      }
+      lifecycle_disconnect: {
+        Args: {
+          p_account_id: string
+          p_expected_version: number
+          p_purge: boolean
+          p_user_id: string
+        }
+        Returns: boolean
+      }
+      vault_create_secret: {
+        Args: { description?: string; name: string; secret: string }
+        Returns: string
+      }
+      vault_delete_secret: { Args: { secret_name: string }; Returns: undefined }
+      vault_update_secret: {
+        Args: { new_secret: string; secret_id: string }
+        Returns: undefined
+      }
     }
     Enums: {
       [_ in never]: never

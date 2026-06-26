@@ -27,3 +27,27 @@ export async function initiateOAuth(provider: Provider): Promise<void> {
     window.location.href = data.url
   }
 }
+
+export async function disconnectAccount(accountId: string, purgeMessages: boolean): Promise<void> {
+  const { error } = await supabase.functions.invoke('google-account-disconnect', {
+    body: { accountId, purgeMessages },
+  })
+  if (error) throw error
+}
+
+export async function deleteAccount(accountId: string): Promise<void> {
+  const { error } = await supabase.functions.invoke('google-account-delete', {
+    body: { accountId },
+  })
+  if (error) throw error
+}
+
+export async function reconnectAccount(accountId: string): Promise<void> {
+  const { data, error } = await supabase.functions.invoke<{ url: string }>('google-oauth-initiate', {
+    body: { reconnect: true, accountId },
+  })
+  if (error) throw error
+  if (data?.url) {
+    window.location.href = data.url
+  }
+}

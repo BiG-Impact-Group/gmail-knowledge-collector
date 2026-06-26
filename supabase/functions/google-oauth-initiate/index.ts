@@ -21,14 +21,18 @@ function base64url(data: ArrayBuffer): string {
     .replace(/\+/g, '-').replace(/\//g, '_').replace(/=/g, '')
 }
 
-async function buildStateJwt(userId: string, stateSecret: string, nonce: string): Promise<string> {
+interface StatePayloadInput {
+  user_id: string
+  nonce: string
+  exp: number
+  reconnect_account_id?: string
+  provider?: string
+}
+
+async function buildStateJwt(payload: StatePayloadInput, stateSecret: string): Promise<string> {
   const header = base64url(new TextEncoder().encode(JSON.stringify({ alg: 'HS256', typ: 'JWT' })))
-  const payload = base64url(new TextEncoder().encode(JSON.stringify({
-    user_id: userId,
-    nonce,
-    exp: Math.floor(Date.now() / 1000) + 300,
-  })))
-  const signingInput = `${header}.${payload}`
+  const payloadEncoded = base64url(new TextEncoder().encode(JSON.stringify(payload)))
+  const signingInput = `${header}.${payloadEncoded}`
   const key = await crypto.subtle.importKey(
     'raw',
     new TextEncoder().encode(stateSecret),
@@ -51,6 +55,10 @@ Deno.serve(async (req: Request) => {
     return new Response(null, { headers: corsHeaders })
   }
 
+  if (req.method !== 'POST') {
+    return Response.json({ error: 'Method not allowed' }, { status: 405, headers: corsHeaders })
+  }
+
   const supabaseUrl = Deno.env.get('SUPABASE_URL')!
   const supabaseAnonKey = Deno.env.get('SUPABASE_ANON_KEY')!
   const serviceRoleKey = Deno.env.get('SUPABASE_SERVICE_ROLE_KEY')!
@@ -71,8 +79,40 @@ Deno.serve(async (req: Request) => {
     return Response.json({ error: 'Unauthorized' }, { status: 401, headers: corsHeaders })
   }
 
+  // Parse body for optional reconnect parameters
+  let reconnectAccountId: string | undefined
+  try {
+    const body = await req.json().catch(() => ({})) as { reconnect?: boolean; accountId?: string }
+    if (body.reconnect === true && body.accountId) {
+      reconnectAccountId = body.accountId
+    }
+  } catch {
+    // No body or invalid JSON — treat as new connection
+  }
+
+  // If reconnect, verify account ownership before issuing redirect
+  if (reconnectAccountId) {
+    const supabaseAdmin = createClient(supabaseUrl, serviceRoleKey)
+    const { data: account, error: fetchErr } = await supabaseAdmin
+      .from('connected_accounts')
+      .select('id, provider')
+      .eq('id', reconnectAccountId)
+      .eq('user_id', user.id)
+      .single()
+
+    if (fetchErr || !account) {
+      return Response.json({ error: 'Account not found or not owned by this user' }, { status: 404, headers: corsHeaders })
+    }
+  }
+
   const nonce = crypto.randomUUID()
-  const state = await buildStateJwt(user.id, stateSecret, nonce)
+  const statePayload: StatePayloadInput = {
+    user_id: user.id,
+    nonce,
+    exp: Math.floor(Date.now() / 1000) + 300,
+    ...(reconnectAccountId ? { reconnect_account_id: reconnectAccountId, provider: 'google' } : {}),
+  }
+  const state = await buildStateJwt(statePayload, stateSecret)
 
   // Store nonce server-side so the callback can consume it exactly once (replay protection)
   const supabaseAdmin = createClient(supabaseUrl, serviceRoleKey)
