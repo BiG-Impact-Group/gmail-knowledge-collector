@@ -87,13 +87,20 @@ Deno.serve(async (req: Request) => {
 
   // Fetch refresh token from Vault
   const { data: refreshToken, error: vaultErr } = await supabaseAdmin
-    .rpc('vault_get_secret', { secret_name: account.id })
+    .rpc('get_vault_secret', { secret_name: account.id })
 
   if (vaultErr) {
     console.error('Vault fetch error:', JSON.stringify(vaultErr))
     return Response.json({ error: 'Failed to access vault' }, { status: 502, headers: corsHeaders })
   }
-  const tokenToRevoke: string = refreshToken ?? ''
+  if (!refreshToken) {
+    // No Vault secret — we cannot verify the Google grant is dead. Require manual revoke.
+    return Response.json(
+      { error: 'no_vault_token', message: 'Revoke access at myaccount.google.com/permissions, then retry.' },
+      { status: 502, headers: corsHeaders },
+    )
+  }
+  const tokenToRevoke: string = refreshToken
 
   // Revoke Google token — on 5xx/network error, abort (do NOT delete)
   const revoke = await revokeGoogleToken(tokenToRevoke)

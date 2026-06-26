@@ -195,7 +195,9 @@ Deno.serve(async (req: Request) => {
         throw new Error('email_mismatch')
       }
 
-      // Update the row by ID (not email upsert — detect concurrent delete)
+      // Update the row by ID, guarded on lifecycle_version to detect concurrent disconnect/delete.
+      // If lifecycle_disconnect/lifecycle_delete ran between initiate and callback, they increment
+      // lifecycle_version; this .eq() guard produces 0 rows → throws concurrent_delete below.
       const { data: updatedRows, error: updateErr } = await supabaseAdmin
         .from('connected_accounts')
         .update({
@@ -210,6 +212,7 @@ Deno.serve(async (req: Request) => {
         })
         .eq('id', reconnectAccountId)
         .eq('user_id', userId)
+        .eq('lifecycle_version', existingAccount.lifecycle_version)
         .select('id')
 
       if (updateErr) {
