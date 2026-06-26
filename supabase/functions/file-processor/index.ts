@@ -183,16 +183,37 @@ async function convertPdf(bytes: Uint8Array): Promise<ConversionResult> {
   return { outcome: 'extracted', text: truncateUtf8(text, MAX_MARKDOWN_BYTES), error: null }
 }
 
+// Inspect a zip's central-directory metadata WITHOUT decompressing anything. fflate's filter is
+// called once per entry with the uncompressed `originalSize`; returning false skips decompression.
+// This lets us enforce entry-count / uncompressed-size caps BEFORE any decompression (code review
+// v1 C2 — the old guard ran after unzipSync had already inflated the whole archive into memory).
+function inspectZipEntries(bytes: Uint8Array): ZipEntryInfo[] {
+  const infos: ZipEntryInfo[] = []
+  unzipSync(bytes, {
+    filter: (f: { originalSize: number }) => {
+      infos.push({ uncompressedBytes: f.originalSize })
+      return false
+    },
+  })
+  return infos
+}
+
 function convertDocx(bytes: Uint8Array): ConversionResult {
-  let entries: Record<string, Uint8Array>
+  let infos: ZipEntryInfo[]
   try {
-    entries = unzipSync(bytes)
+    infos = inspectZipEntries(bytes)
   } catch {
     return { outcome: 'skipped', text: null, error: 'docx_unzip_failed' }
   }
-  const infos: ZipEntryInfo[] = Object.values(entries).map((u) => ({ uncompressedBytes: u.length }))
   if (!zipWithinLimits(infos, { maxEntries: MAX_ZIP_ENTRIES, maxUncompressedBytes: MAX_UNCOMPRESSED_BYTES })) {
     return { outcome: 'skipped', text: null, error: 'zip_bomb_guard' }
+  }
+  // Decompress ONLY word/document.xml (not the whole archive).
+  let entries: Record<string, Uint8Array>
+  try {
+    entries = unzipSync(bytes, { filter: (f: { name: string }) => f.name === 'word/document.xml' })
+  } catch {
+    return { outcome: 'skipped', text: null, error: 'docx_unzip_failed' }
   }
   const docXml = entries['word/document.xml']
   if (!docXml) {
@@ -207,15 +228,14 @@ function convertDocx(bytes: Uint8Array): ConversionResult {
 }
 
 function convertXlsx(bytes: Uint8Array): ConversionResult {
-  // Zip guard FIRST (Codex v2 #5): xlsx is a zip; gate entry count + uncompressed size before
-  // handing bytes to SheetJS.
-  let entries: Record<string, Uint8Array>
+  // Zip guard FIRST via the metadata-only inspection (code review v1 C2): gate entry count +
+  // total uncompressed size BEFORE SheetJS decompresses the workbook.
+  let infos: ZipEntryInfo[]
   try {
-    entries = unzipSync(bytes)
+    infos = inspectZipEntries(bytes)
   } catch {
     return { outcome: 'skipped', text: null, error: 'xlsx_unzip_failed' }
   }
-  const infos: ZipEntryInfo[] = Object.values(entries).map((u) => ({ uncompressedBytes: u.length }))
   if (!zipWithinLimits(infos, { maxEntries: MAX_ZIP_ENTRIES, maxUncompressedBytes: MAX_UNCOMPRESSED_BYTES })) {
     return { outcome: 'skipped', text: null, error: 'zip_bomb_guard' }
   }
@@ -311,18 +331,6 @@ Deno.serve(async (req: Request) => {
   const { error: enqErr } = await supabaseAdmin.rpc('enqueue_processing_jobs')
   if (!enqErr) enqueued = 1 // RPC returns void; flag that the producer ran.
 
-  // 2. Claim a bounded batch.
-  const { data: jobsData, error: claimErr } = await supabaseAdmin.rpc('claim_processing_jobs', {
-    p_limit: MAX_JOBS_PER_RUN,
-    p_stale_seconds: STALE_SECONDS,
-    p_max_attempts: MAX_ATTEMPTS,
-  })
-  if (claimErr) {
-    return Response.json({ error: 'claim_failed' }, { status: 500 })
-  }
-  const jobs = (jobsData ?? []) as ClaimedJob[]
-  claimed = jobs.length
-
   // Cache the refreshed access token per connected account within this run.
   const tokenCache = new Map<string, string | null>()
 
@@ -358,10 +366,21 @@ Deno.serve(async (req: Request) => {
     else if (r.outcome === 'retry') retried++
   }
 
-  for (const job of jobs) {
-    // A single synchronous parser call cannot be preempted in Deno (Codex v2 #6); per-file CPU is
-    // bounded by the input caps. The run deadline only gates whether the NEXT file is started.
-    if (Date.now() - startedAt > RUN_DEADLINE_MS) break
+  // Claim ONE job at a time, only while under the run deadline and the per-run cap (code review
+  // v1 I5). This never leases a job we won't process — claiming upfront would burn an attempt on
+  // unstarted jobs if the deadline tripped mid-batch. A single synchronous parser call cannot be
+  // preempted in Deno; per-file CPU is bounded by the input caps.
+  while (claimed < MAX_JOBS_PER_RUN && Date.now() - startedAt <= RUN_DEADLINE_MS) {
+    const { data: jobsData, error: claimErr } = await supabaseAdmin.rpc('claim_processing_jobs', {
+      p_limit: 1,
+      p_stale_seconds: STALE_SECONDS,
+      p_max_attempts: MAX_ATTEMPTS,
+    })
+    if (claimErr) break
+    const batch = (jobsData ?? []) as ClaimedJob[]
+    if (batch.length === 0) break // queue drained
+    const job = batch[0]
+    claimed++
 
     try {
       const accessToken = await getToken(job.connected_account_id)
