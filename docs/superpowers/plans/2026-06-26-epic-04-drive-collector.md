@@ -1,13 +1,13 @@
 # Epic 04 Design: drive-collector
 
-**Status:** Rev 2 — post Codex plan review v1 (3 criticals + 10 importants accepted and addressed)  
+**Status:** Rev 3 — post Codex plan review v2 (1 new critical + 6 importants accepted and addressed; v1's 3 criticals + 10 importants resolved in Rev 2)  
 **Date:** 2026-06-26  
 **Builder base branch:** `feature/epic-03-oauth-lifecycle` (stacked; merges when Epic 03 lands in `test`)  
 **Build branch:** `feature/epic-04-drive-collector`
 
 ## Phase 0 gate (verify before any implementation)
 
-Before implementing EU-04-5/6/7, confirm Epic 03 is fully present and applied:
+Before implementing **any** Epic 04 work unit — the `documents` composite FK (EU-04-1), the `lifecycle_rpcs_v5` purge extension (EU-04-2), and the callback provider/scope changes (EU-04-6) all depend on Epic 03 schema state, not just the OAuth units — confirm Epic 03 is fully present and applied:
 
 1. `npx supabase migration list --linked` shows in the Remote column: `lifecycle_version`, `add_provider_unique_key`, `vault_delete_secret`, `lifecycle_rpcs`, `lifecycle_rpcs_v2`, `drop_old_unique_key`, `fix_collect_messages_label_ids`, `lifecycle_rpcs_v3`.
 2. `connected_accounts` has `UNIQUE(user_id, provider, email_address)` and NOT the old `UNIQUE(user_id, email_address)`.
@@ -133,11 +133,12 @@ No INSERT/UPDATE/DELETE for `authenticated`. Collector writes under service role
 ```sql
 CREATE INDEX IF NOT EXISTS documents_user_id_idx ON documents (user_id);
 CREATE INDEX IF NOT EXISTS documents_account_id_idx ON documents (connected_account_id);
--- UI lists sort by drive_modified_time DESC — indexes match the actual query order (Codex v1 #8)
+-- UI lists sort by drive_modified_time DESC NULLS LAST — index ordering MUST match
+-- the query's NULLS ordering or Postgres won't use it for the sort (Codex v1 #8, v2 #5)
 CREATE INDEX IF NOT EXISTS documents_user_id_modified_idx
-  ON documents (user_id, drive_modified_time DESC);
+  ON documents (user_id, drive_modified_time DESC NULLS LAST);
 CREATE INDEX IF NOT EXISTS documents_user_account_modified_idx
-  ON documents (user_id, connected_account_id, drive_modified_time DESC);
+  ON documents (user_id, connected_account_id, drive_modified_time DESC NULLS LAST);
 CREATE INDEX IF NOT EXISTS documents_content_status_idx
   ON documents (content_status) WHERE content_status != 'extracted';
 ```
@@ -159,6 +160,25 @@ export type Provider = 'google' | 'google_drive' | 'microsoft' | 'slack'
 ### Migration 1 — `documents_table`
 
 Creates `documents` table with RLS and indexes. See data model above. Idempotent (`IF NOT EXISTS`, `IF NOT EXISTS` on policies via DO block).
+
+**Self-repair guard (Codex v2 #2):** Because `documents` is new, `CREATE TABLE IF NOT EXISTS` is normally enough — but if a partial/earlier `documents` table exists (e.g. from an aborted run with the old single-column FK), wrap a DO-block that drops any FK named `documents_connected_account_id_fkey` and ensures `documents_user_account_fk` exists and is validated:
+
+```sql
+DO $$
+BEGIN
+  IF EXISTS (SELECT 1 FROM information_schema.table_constraints
+             WHERE table_name='documents' AND constraint_name='documents_connected_account_id_fkey') THEN
+    ALTER TABLE documents DROP CONSTRAINT documents_connected_account_id_fkey;
+  END IF;
+  IF NOT EXISTS (SELECT 1 FROM information_schema.table_constraints
+                 WHERE table_name='documents' AND constraint_name='documents_user_account_fk') THEN
+    ALTER TABLE documents
+      ADD CONSTRAINT documents_user_account_fk
+      FOREIGN KEY (user_id, connected_account_id)
+      REFERENCES connected_accounts(user_id, id) ON DELETE CASCADE;
+  END IF;
+END $$;
+```
 
 ### Migration 2 — `lifecycle_rpcs_v5`
 
@@ -345,21 +365,26 @@ The Drive Changes start token must be captured *before* the first Files page so 
      GET /drive/v3/changes/startPageToken   → store result in sync_cursor immediately
      (this is the "drain from here after backfill" token, captured before page 1)
 
-2. GET /drive/v3/files
+2. Loop up to MAX_PAGES_PER_RUN (4) pages:
+   GET /drive/v3/files
      ?q=trashed=false
      &fields=nextPageToken,files(id,name,mimeType,webViewLink,size,modifiedTime)
-     &pageSize=100
+     &pageSize=25            (DRIVE_PAGE_SIZE — whole-page processing fits wall-clock)
      &pageToken=<backfill_page_token if set>
      &corpora=user            (personal Drive only; excludes Shared Drives)
 
-3. For each file: classify MIME type → extract or mark → upsert to documents
+   For each file in the page: classify MIME type → extract or mark → upsert to documents
      ON CONFLICT (connected_account_id, drive_file_id) DO UPDATE
+   (process the WHOLE page before checkpointing)
 
-4. If response has nextPageToken:
-     persist backfill_page_token = nextPageToken (re-check status='active' first), continue next run
-   Else (final page):
-     persist backfill_complete = true, backfill_page_token = null
-     (sync_cursor already holds the pre-backfill start token from step 1 — do NOT overwrite it)
+   After the page, re-check status='active', then:
+     If response has nextPageToken:
+       persist backfill_page_token = nextPageToken
+       if pages-this-run >= MAX_PAGES_PER_RUN: stop (resume next tick); else continue loop
+     Else (final page):
+       persist backfill_complete = true, backfill_page_token = null
+       (sync_cursor already holds the pre-backfill start token from step 1 — do NOT overwrite it)
+       break
 ```
 
 Note `backfill_start_history_id` is NOT used for Drive — the pre-backfill token lives in `sync_cursor` from the start. `backfill_start_history_id` stays NULL.
@@ -370,35 +395,44 @@ The Drive Changes API returns `nextPageToken` while more change pages remain, an
 
 ```
 let pageToken = account.sync_cursor
-let newCursor = null
+let pagesThisRun = 0
 loop:
   GET /drive/v3/changes
     ?pageToken=<pageToken>
-    &fields=nextPageToken,newStartPageToken,changes(fileId,removed,file(id,name,mimeType,webViewLink,size,modifiedTime))
-    &pageSize=100
+    &fields=nextPageToken,newStartPageToken,changes(fileId,removed,file(id,name,mimeType,webViewLink,size,modifiedTime,trashed))
+    &pageSize=25            (DRIVE_PAGE_SIZE)
     &includeRemoved=true
     &restrictToMyDrive=true        (personal Drive only)
+    # note: file(...,trashed) is in the mask — Drive omits trashed unless requested (Codex v2 #4)
 
-  On 410 Gone (token expired): reset account to re-enter backfill
-    (backfill_complete=false, sync_cursor=null, backfill_page_token=null) and break
+  On 410 Gone (token expired): the cursor is unrecoverable and we may have missed deletions.
+    Purge the account's documents and re-enter a clean backfill (Codex v2 #3):
+      DELETE FROM documents WHERE connected_account_id = account.id
+      UPDATE: backfill_complete=false, sync_cursor=null, backfill_page_token=null
+    then break (next run rebuilds from scratch; pre-backfill start token re-captured fresh)
 
-  For each change:
-    - If change.removed === true OR change.file?.trashed:
-        DELETE FROM documents WHERE drive_file_id = change.fileId AND connected_account_id = account.id
-    - Else if change.file:
-        classify + upsert
+  Process the WHOLE page:
+    For each change:
+      - If change.removed === true OR change.file?.trashed === true:
+          DELETE FROM documents WHERE drive_file_id = change.fileId AND connected_account_id = account.id
+      - Else if change.file:
+          classify + upsert
 
+  re-check status='active'
   If response.nextPageToken:
-    pageToken = response.nextPageToken   # more pages — keep going
+    pageToken = response.nextPageToken
+    persist sync_cursor = pageToken     # nextPageToken is a valid resume pageToken
+    pagesThisRun++
+    if pagesThisRun >= MAX_PAGES_PER_RUN: break   # resume next tick from sync_cursor
     continue
   Else:
-    newCursor = response.newStartPageToken  # final page only
+    persist sync_cursor = response.newStartPageToken  # final page only
     break
 
-After loop: re-check status='active', then UPDATE sync_cursor = newCursor, last_synced_at = now()
+UPDATE last_synced_at = now() at the end.
 ```
 
-Bound the loop to a max number of pages per run (e.g. 25) to respect edge-function wall-clock; if the cap is hit, persist the last `nextPageToken` as `sync_cursor` and resume next run (a `nextPageToken` is itself a valid `pageToken` for the next Changes call).
+Checkpointing is page-aligned: `sync_cursor` always holds a valid `pageToken` (either the next `nextPageToken` or the terminal `newStartPageToken`). Capping at `MAX_PAGES_PER_RUN` is safe because we only ever persist a token after a whole page is applied.
 
 **MIME type classification:**
 
@@ -467,9 +501,35 @@ async function driveFetch(url, init, maxRetries = 3): Promise<Response> {
 
 (403 is retried only when the body/reason indicates a rate-limit reason; a 403 for `insufficientPermissions` should not retry — inspect `error.errors[0].reason` and only back off for `rateLimitExceeded` / `userRateLimitExceeded`.)
 
-**Per-run caps:** process at most `MAX_FILES_PER_RUN = 80` content extractions per account per run (metadata-only files don't count). If the cap is hit mid-page, persist the current `backfill_page_token`/`sync_cursor` and resume next cron tick. This keeps each run within the edge-function wall-clock limit and provides natural backpressure on the Drive quota.
+**Per-run caps — checkpoint ONLY at page boundaries (Codex v2 critical):** Drive page tokens resume at page boundaries, not item offsets, so we must never stop mid-page. Bound the run by *pages*, not files:
+
+- Set Drive `pageSize` small enough that one full page of content extractions fits the edge-function wall-clock: `DRIVE_PAGE_SIZE = 25` for both Files (backfill) and Changes (incremental).
+- Process **whole pages only**. After each fully-processed page, persist the page token (`backfill_page_token` for backfill, or the `nextPageToken` as `sync_cursor` for incremental) — these tokens are valid resume points.
+- Cap at `MAX_PAGES_PER_RUN = 4` pages per account per run (≈100 files/run at pageSize 25). If the cap is hit, persist the next page token and resume on the next cron tick. Never persist a token mid-page; never partially process a page and checkpoint.
+
+This removes the mid-page-skip/reprocess-forever hazard: a persisted token always points exactly at the first unprocessed page.
 
 **Error counters carry no PII:** log only counts and Drive error reasons, never file names or content.
+
+**Bounded content read (Codex v2 #7):** Do not call `await res.text()` on an unbounded export — a huge Workspace export would spike memory. Read the response body through a bounded reader that cancels the stream once 500 KB have been accumulated:
+
+```typescript
+async function readBounded(res: Response, maxBytes = 500_000): Promise<string> {
+  const reader = res.body?.getReader()
+  if (!reader) return (await res.text()).slice(0, maxBytes)
+  const chunks: Uint8Array[] = []
+  let total = 0
+  while (total < maxBytes) {
+    const { done, value } = await reader.read()
+    if (done) break
+    chunks.push(value); total += value.length
+  }
+  await reader.cancel()  // stop downloading once we have enough
+  return new TextDecoder().decode(concat(chunks)).slice(0, maxBytes)
+}
+```
+
+Unit-test this helper (Codex v2 #7): asserts it stops at the cap and cancels the stream.
 
 **Upsert to `documents`:**
 
@@ -615,9 +675,9 @@ Use existing design tokens. No new token values.
 
 ### `src/services/documents.service.test.ts`
 
-- `listDocuments` calls correct Supabase query, returns typed rows
+- `listDocuments` calls correct Supabase query (ordered `drive_modified_time DESC NULLS LAST`, `.range()` pagination), returns typed rows + `hasMore`
 - `getDocument` handles not-found (returns null)
-- `initiateGoogleDriveOAuth` calls correct edge function, returns `{ url }`
+- `initiateGoogleDriveOAuth` calls the correct edge function and sets `window.location.href` to the returned URL (returns `Promise<void>`, does NOT return `{ url }`) — mock `window.location` (Codex v2 #6)
 - Error propagation
 
 ### `src/components/documents/DocumentsPage.test.tsx`
