@@ -1,6 +1,6 @@
 # Epic 05 — file-processing-pipeline
 
-**Status:** Rev 2 — post Codex plan review v1 (4 criticals + importants addressed)
+**Status:** Rev 3 — post Codex plan review v2 (2 new criticals + partials addressed: complete derives document_id from job + enforces lifecycle_version; xlsx zip-guarded + byte-bounded; search_path on all RPCs; cooperative-deadline limits noted). v1's 4 criticals resolved in Rev 2.
 **Date:** 2026-06-26
 **Base branch:** `test` (Epic 03 + 04 merged). Build branch: `feature/epic-05-file-processing-pipeline`.
 **Depends on:** Epic 04 (`documents` table, `content_status='needs_processing'` rows, `collect_account_documents` RPC).
@@ -88,7 +88,7 @@ CREATE INDEX IF NOT EXISTS processing_jobs_user_id_idx ON processing_jobs (user_
 
 Permanent failures live on the job (`status='failed'`); the document is set `'skipped'`. No `'failed'` document status needed.
 
-### Migration 4 — RPCs (all SECURITY DEFINER, `REVOKE … FROM PUBLIC, anon, authenticated; GRANT EXECUTE … TO service_role`)
+### Migration 4 — RPCs (all `SECURITY DEFINER SET search_path = public`, schema-qualified refs, `REVOKE … FROM PUBLIC, anon, authenticated; GRANT EXECUTE … TO service_role`) (Codex v2 #3)
 
 **`enqueue_processing_jobs()`** — producer. Inserts a `pending` job for every `documents` row with `content_status='needs_processing'`; on conflict **reopens** a terminal job (so a file that changed and was reset re-runs), but leaves in-flight jobs alone (Codex v1 #10):
 
@@ -104,9 +104,9 @@ ON CONFLICT (document_id) DO UPDATE
 1. **Cap-fail crashed jobs** (Codex v1 #4): stale `processing` jobs with `attempts >= p_max_attempts` → `status='failed', last_error='max_attempts'`, and their still-`needs_processing` documents → `content_status='skipped'`.
 2. **Claim** with `FOR UPDATE OF pj SKIP LOCKED` (no double-claim), joining `documents` + `connected_accounts`, only for `ca.status='active' AND ca.provider='google_drive'` (Codex v1 #8). Eligible = `pending` OR (`processing` AND stale AND `attempts < p_max_attempts`). Set `status='processing', claimed_at=now(), attempts=attempts+1`. Return `claimed_at` (lease) + `lifecycle_version`.
 
-**`complete_processing_job(p_job_id, p_document_id, p_claimed_at, p_attempts, p_outcome, p_text, p_error, p_max_attempts)`** — finalizes atomically with a **document row lock + lease guard** (Codex v1 #2, #3):
-1. `PERFORM 1 FROM documents WHERE id=p_document_id FOR UPDATE` — serializes against `collect_account_documents` (which row-locks the same document). If gone (account purged) → mark job `failed`/`document_gone`, return.
-2. Lease guard: `PERFORM 1 FROM processing_jobs WHERE id=p_job_id AND status='processing' AND claimed_at=p_claimed_at AND attempts=p_attempts FOR UPDATE`. If `NOT FOUND` → a newer attempt owns the job; **return without writing** (Codex v1 #3).
+**`complete_processing_job(p_job_id, p_claimed_at, p_attempts, p_lifecycle_version, p_outcome, p_text, p_error, p_max_attempts)`** — finalizes atomically with a **lease guard + document row lock + lifecycle recheck**. Note there is NO `p_document_id` param — the document is derived from the job row so a caller bug can't write to the wrong document (Codex v2 #1):
+1. **Lease guard, derives document_id:** `SELECT document_id INTO v_doc FROM processing_jobs WHERE id=p_job_id AND status='processing' AND claimed_at=p_claimed_at AND attempts=p_attempts FOR UPDATE;` If `NOT FOUND` → a newer attempt owns the job (or it was reset); **return without writing** (Codex v1 #3).
+2. **Lock the document + recheck lifecycle:** `SELECT d.content_status, ca.status, ca.lifecycle_version FROM documents d JOIN connected_accounts ca ON ca.id=d.connected_account_id WHERE d.id=v_doc FOR UPDATE OF d;` If the document is gone (account purged) → mark job `failed`/`document_gone`, return. If `ca.status<>'active'` OR `ca.lifecycle_version<>p_lifecycle_version` → a disconnect/reconnect happened after claim; the extraction is stale → **do not write the document**; set job `pending`, `claimed_at=NULL` (re-collection/re-enqueue will redo it), return (Codex v2 #2). The document `FOR UPDATE` serializes against `collect_account_documents`' row lock (Codex v1 #2).
 3. Apply outcome:
    - `'extracted'` → `documents.text_content=p_text, content_status='extracted'`; job `done`.
    - `'needs_ocr'` → `documents.content_status='needs_ocr'`; job `needs_ocr`.
@@ -124,16 +124,16 @@ CRON_SECRET bearer auth. Constants: `MAX_JOBS_PER_RUN=3`, `STALE_SECONDS=600`, `
 Per run:
 1. `enqueue_processing_jobs()`.
 2. `claim_processing_jobs(MAX_JOBS_PER_RUN, STALE_SECONDS, MAX_ATTEMPTS)`.
-3. For each claimed job (stop if `RUN_DEADLINE_MS` exceeded — Codex v1 #6):
+3. For each claimed job (stop starting new jobs if `RUN_DEADLINE_MS` exceeded). Note: a single synchronous parser call cannot be preempted in Deno, so **per-file CPU is bounded by the input caps** (`MAX_FILE_BYTES`, `MAX_PDF_PAGES`, `MAX_XLSX_CELLS`, zip caps), not by a timer; the run deadline only gates whether the next file is started (Codex v2 #6):
    a. Per `connected_account_id`: `get_vault_secret`, refresh access token (reuse collector helper). Missing token → `complete(..., 'retry', 'no_token')`.
    b. **Bounded binary download** (Codex v1 #7): `readBytesBounded()` streams `GET /drive/v3/files/{id}?alt=media`, aborting once bytes exceed `MAX_FILE_BYTES` (never trusts Content-Length, never silently truncates binary). Over cap → `complete(..., 'skipped', 'file_too_large')`.
    c. Convert by `mime_type` with hard caps:
       - `application/pdf` → `unpdf` `extractText` (cap `MAX_PDF_PAGES`). Empty/whitespace across all pages → `needs_ocr`; else `extracted`.
       - `.docx` → `fflate` unzip but **zip-bomb guarded** (Codex v1 #5): reject if entry count > `MAX_ZIP_ENTRIES`, any entry or total uncompressed > caps; decompress **only** `word/document.xml`; extract `<w:t>`/`<w:p>` → markdown.
-      - `.xlsx` → SheetJS `read`, but reject if total cells across sheets > `MAX_XLSX_CELLS` (check `!ref` ranges before materializing); each sheet → markdown (`## sheet` + CSV).
+      - `.xlsx` → **same zip guard as docx first** (`zipWithinLimits` on entry count + uncompressed size — Codex v2 #5) before handing bytes to SheetJS `read`; reject if total cells across sheets > `MAX_XLSX_CELLS` (check `!ref` ranges before materializing); generate markdown sheet-by-sheet (`## sheet` + CSV) and **stop appending once `MAX_MARKDOWN_BYTES` is reached** (byte-bounded during generation, not after — Codex v2 #4).
       - legacy/other (`application/msword`, `…ms-excel`, `…ms-powerpoint`, `…presentationml.presentation`, `application/rtf`) → `complete(..., 'skipped', 'unsupported_type')`.
    d. Truncate markdown to `MAX_MARKDOWN_BYTES` (byte-bounded, no mid-codepoint split).
-   e. `complete_processing_job(..., 'extracted'|'needs_ocr', text)`; thrown/transient error → `complete(..., 'retry', '<code>')`; oversize/zip-bomb/unsupported → `complete(..., 'skipped', '<code>')`.
+   e. Call `complete_processing_job(job_id, claimed_at, attempts, lifecycle_version, outcome, text, error, MAX_ATTEMPTS)` — passing the lease (`claimed_at`,`attempts`) and `lifecycle_version` from the claim. `outcome` = `'extracted'`/`'needs_ocr'` on success; `'retry'` on thrown/transient error; `'skipped'` on oversize/zip-bomb/unsupported.
 4. Return `{ enqueued, claimed, extracted, needs_ocr, skipped, retried }`.
 
 **Library viability gate (Codex v1 #13):** builder pins + verifies `unpdf`/`fflate`/`xlsx` import under the edge runtime during implementation. If `unpdf` is unviable, PDFs get `complete(..., 'retry', 'pdf_parser_unavailable')` (stays `needs_processing`, retryable) — **never** mislabeled `needs_ocr`. docx/xlsx paths ship regardless.
