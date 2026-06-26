@@ -1,6 +1,6 @@
 # Epic 05 — file-processing-pipeline
 
-**Status:** Rev 3 — post Codex plan review v2 (2 new criticals + partials addressed: complete derives document_id from job + enforces lifecycle_version; xlsx zip-guarded + byte-bounded; search_path on all RPCs; cooperative-deadline limits noted). v1's 4 criticals resolved in Rev 2.
+**Status:** Rev 4 — Codex plan review v3 returned ZERO criticals (gate passed). Rev 4 adds the one residual important: claim returns drive_modified_time; complete rechecks it (content-version guard) so a file changing between claim and completion can't be overwritten with stale extraction.
 **Date:** 2026-06-26
 **Base branch:** `test` (Epic 03 + 04 merged). Build branch: `feature/epic-05-file-processing-pipeline`.
 **Depends on:** Epic 04 (`documents` table, `content_status='needs_processing'` rows, `collect_account_documents` RPC).
@@ -100,13 +100,17 @@ ON CONFLICT (document_id) DO UPDATE
   WHERE processing_jobs.status IN ('done','failed','needs_ocr');
 ```
 
-**`claim_processing_jobs(p_limit int, p_stale_seconds int, p_max_attempts int)`** — returns `TABLE(job_id, document_id, user_id, attempts, claimed_at, drive_file_id, mime_type, connected_account_id, lifecycle_version)` (NO file name — Codex v1 #12). Steps:
+**`claim_processing_jobs(p_limit int, p_stale_seconds int, p_max_attempts int)`** — returns `TABLE(job_id, document_id, user_id, attempts, claimed_at, drive_file_id, mime_type, connected_account_id, lifecycle_version, drive_modified_time)` (NO file name — Codex v1 #12). `drive_modified_time` is the file's value at claim time, used as a content-version token at completion (Codex v3). Steps:
 1. **Cap-fail crashed jobs** (Codex v1 #4): stale `processing` jobs with `attempts >= p_max_attempts` → `status='failed', last_error='max_attempts'`, and their still-`needs_processing` documents → `content_status='skipped'`.
 2. **Claim** with `FOR UPDATE OF pj SKIP LOCKED` (no double-claim), joining `documents` + `connected_accounts`, only for `ca.status='active' AND ca.provider='google_drive'` (Codex v1 #8). Eligible = `pending` OR (`processing` AND stale AND `attempts < p_max_attempts`). Set `status='processing', claimed_at=now(), attempts=attempts+1`. Return `claimed_at` (lease) + `lifecycle_version`.
 
-**`complete_processing_job(p_job_id, p_claimed_at, p_attempts, p_lifecycle_version, p_outcome, p_text, p_error, p_max_attempts)`** — finalizes atomically with a **lease guard + document row lock + lifecycle recheck**. Note there is NO `p_document_id` param — the document is derived from the job row so a caller bug can't write to the wrong document (Codex v2 #1):
+**`complete_processing_job(p_job_id, p_claimed_at, p_attempts, p_lifecycle_version, p_drive_modified_time, p_outcome, p_text, p_error, p_max_attempts)`** — finalizes atomically with a **lease guard + document row lock + lifecycle recheck + content-version recheck**. Note there is NO `p_document_id` param — the document is derived from the job row so a caller bug can't write to the wrong document (Codex v2 #1):
 1. **Lease guard, derives document_id:** `SELECT document_id INTO v_doc FROM processing_jobs WHERE id=p_job_id AND status='processing' AND claimed_at=p_claimed_at AND attempts=p_attempts FOR UPDATE;` If `NOT FOUND` → a newer attempt owns the job (or it was reset); **return without writing** (Codex v1 #3).
-2. **Lock the document + recheck lifecycle:** `SELECT d.content_status, ca.status, ca.lifecycle_version FROM documents d JOIN connected_accounts ca ON ca.id=d.connected_account_id WHERE d.id=v_doc FOR UPDATE OF d;` If the document is gone (account purged) → mark job `failed`/`document_gone`, return. If `ca.status<>'active'` OR `ca.lifecycle_version<>p_lifecycle_version` → a disconnect/reconnect happened after claim; the extraction is stale → **do not write the document**; set job `pending`, `claimed_at=NULL` (re-collection/re-enqueue will redo it), return (Codex v2 #2). The document `FOR UPDATE` serializes against `collect_account_documents`' row lock (Codex v1 #2).
+2. **Lock the document + recheck lifecycle + content version:** `SELECT d.content_status, d.drive_modified_time, ca.status, ca.lifecycle_version FROM documents d JOIN connected_accounts ca ON ca.id=d.connected_account_id WHERE d.id=v_doc FOR UPDATE OF d;` Then, any of these → **do not write the document**, set job `pending`/`claimed_at=NULL`, return:
+   - document gone (account purged) → instead mark job `failed`/`document_gone`;
+   - `ca.status<>'active'` OR `ca.lifecycle_version<>p_lifecycle_version` → disconnect/reconnect after claim (Codex v2 #2);
+   - `d.drive_modified_time IS DISTINCT FROM p_drive_modified_time` → the file changed after claim and the collector already reset the document; this extraction is of stale content (Codex v3). A fresh job (re-enqueued by the producer) reprocesses the new version.
+   The document `FOR UPDATE` serializes against `collect_account_documents`' row lock (Codex v1 #2).
 3. Apply outcome:
    - `'extracted'` → `documents.text_content=p_text, content_status='extracted'`; job `done`.
    - `'needs_ocr'` → `documents.content_status='needs_ocr'`; job `needs_ocr`.
@@ -133,7 +137,7 @@ Per run:
       - `.xlsx` → **same zip guard as docx first** (`zipWithinLimits` on entry count + uncompressed size — Codex v2 #5) before handing bytes to SheetJS `read`; reject if total cells across sheets > `MAX_XLSX_CELLS` (check `!ref` ranges before materializing); generate markdown sheet-by-sheet (`## sheet` + CSV) and **stop appending once `MAX_MARKDOWN_BYTES` is reached** (byte-bounded during generation, not after — Codex v2 #4).
       - legacy/other (`application/msword`, `…ms-excel`, `…ms-powerpoint`, `…presentationml.presentation`, `application/rtf`) → `complete(..., 'skipped', 'unsupported_type')`.
    d. Truncate markdown to `MAX_MARKDOWN_BYTES` (byte-bounded, no mid-codepoint split).
-   e. Call `complete_processing_job(job_id, claimed_at, attempts, lifecycle_version, outcome, text, error, MAX_ATTEMPTS)` — passing the lease (`claimed_at`,`attempts`) and `lifecycle_version` from the claim. `outcome` = `'extracted'`/`'needs_ocr'` on success; `'retry'` on thrown/transient error; `'skipped'` on oversize/zip-bomb/unsupported.
+   e. Call `complete_processing_job(job_id, claimed_at, attempts, lifecycle_version, drive_modified_time, outcome, text, error, MAX_ATTEMPTS)` — passing the lease (`claimed_at`,`attempts`), `lifecycle_version`, and `drive_modified_time` from the claim. `outcome` = `'extracted'`/`'needs_ocr'` on success; `'retry'` on thrown/transient error; `'skipped'` on oversize/zip-bomb/unsupported.
 4. Return `{ enqueued, claimed, extracted, needs_ocr, skipped, retried }`.
 
 **Library viability gate (Codex v1 #13):** builder pins + verifies `unpdf`/`fflate`/`xlsx` import under the edge runtime during implementation. If `unpdf` is unviable, PDFs get `complete(..., 'retry', 'pdf_parser_unavailable')` (stays `needs_processing`, retryable) — **never** mislabeled `needs_ocr`. docx/xlsx paths ship regardless.
