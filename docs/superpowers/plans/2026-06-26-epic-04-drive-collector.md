@@ -1,6 +1,6 @@
 # Epic 04 Design: drive-collector
 
-**Status:** Rev 5 — post Codex plan review v4 (RPC-only write path made explicit; delete/reset status-checked; reconnect provider-mismatch guard; RPC payload chunking; Content-Length pre-check). v1–v3 findings resolved in Rev 2–4.  
+**Status:** Rev 6 — Codex plan review v5 returned **zero criticals** (gate passed). Rev 6 closes the 3 residual importants: cursor-only RPC for empty/deletion-only pages, token-error status update guarded on `status='active'`, transient extraction failures persisted as `needs_processing` (not dropped). v1–v4 findings resolved in Rev 2–5.  
 **Date:** 2026-06-26  
 **Builder base branch:** `feature/epic-03-oauth-lifecycle` (stacked; merges when Epic 03 lands in `test`)  
 **Build branch:** `feature/epic-04-drive-collector`
@@ -475,7 +475,11 @@ const statePayload = {
 2. For each account:
    a. Get refresh token from Vault (get_vault_secret)
    b. Refresh access token (same token refresh path as gmail-collector)
-   c. On invalid_grant / token_revoked → update status = 'error', continue
+   c. On invalid_grant / token_revoked → set status='error' but ONLY if currently active:
+        UPDATE connected_accounts SET status='error', updated_at=now()
+          WHERE id = account.id AND status = 'active'
+      (the `status='active'` guard prevents a stale in-flight collector from clobbering a
+       concurrent user disconnect/revoke — Codex v5). Then continue.
    d. If !backfill_complete → BACKFILL PATH
    e. Else → INCREMENTAL PATH (Drive Changes API)
 ```
@@ -694,7 +698,9 @@ There is **no** direct `supabaseAdmin.from('documents').upsert(...)` anywhere in
 
 **RPC payload chunking (Codex v4):** a 25-doc page with 500 KB text each is ~12.5 MB of JSON — over typical request limits. Split each page's `pageDocs` into sub-batches of at most `RPC_DOC_BATCH = 5` docs (and/or a ~3 MB serialized ceiling) and call `collect_account_documents` once per sub-batch with `p_backfill_page_token='__unchanged__'`, `p_sync_cursor='__unchanged__'`. Only the **final** sub-batch of the page carries the real cursor/backfill-state advance, so the cursor moves only after every doc on the page is durably written. If an earlier sub-batch fails, the cursor is not advanced and the page is retried next run (upserts are idempotent on `(connected_account_id, drive_file_id)`).
 
-**Error handling:** Per-file try/catch (skip and count errors, same as gmail-collector). Return `{ processed, errors, accounts: accounts?.length }`.
+**Empty / deletion-only pages (Codex v5):** a Changes page (or even a Files page) can contain zero docs to upsert — e.g. a page that is all removals, or an empty incremental poll. In that case there is no "final sub-batch" to carry the cursor advance, so the collector must still issue **one** `collect_account_documents` call with an empty `p_documents: []` and the real cursor/backfill state, so the cursor always advances. (For incremental, the removals are applied via `delete_account_documents` first, then the cursor-only `collect_account_documents([], ...)` advances `sync_cursor`.) Never leave a processed page without advancing the cursor — that would re-poll the same page forever.
+
+**Error handling (Codex v5):** Per-file try/catch around *content extraction only*. A transient export/download failure must NOT cause the file to be silently dropped while the cursor advances past it — the file would be lost forever. Instead, on extraction failure still build the doc row from the metadata we already have and set `content_status='needs_processing'` (and `text_content=null`), so the row is persisted and Epic 05 (or a later run) can retry extraction. The `content_too_large` case from `readBounded` is handled the same way. Only a failure to even build the metadata row (missing `id`/`name`) is skipped-and-counted. Return `{ processed, errors, accounts: accounts?.length }`.
 
 **Token safety:** Access token never stored. Refresh token read from Vault, never logged. File content never sent externally.
 
