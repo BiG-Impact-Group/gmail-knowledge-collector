@@ -62,16 +62,27 @@ async function fetchEmailFromUserinfo(accessToken: string): Promise<string> {
   return data.email
 }
 
-/** Best-effort token revoke — logs failure but never throws */
-async function tryRevokeToken(refreshToken: string): Promise<void> {
+/**
+ * Best-effort token revoke.
+ * Returns true if the token is definitely gone (revoked or already invalid 4xx).
+ * Returns false if the revoke failed transiently (5xx or network error).
+ */
+async function tryRevokeToken(refreshToken: string): Promise<boolean> {
   try {
-    await fetch(GOOGLE_REVOKE_URL, {
+    const res = await fetch(GOOGLE_REVOKE_URL, {
       method: 'POST',
       headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
       body: new URLSearchParams({ token: refreshToken }),
     })
+    if (res.ok) return true
+    // 4xx = token already invalid/dead — treat as terminal success
+    if (res.status >= 400 && res.status < 500) return true
+    // 5xx = Google-side error — caller should park the token for manual cleanup
+    console.error('Best-effort revoke got 5xx:', res.status)
+    return false
   } catch (e) {
-    console.error('Best-effort revoke failed:', (e as Error).message)
+    console.error('Best-effort revoke network error:', (e as Error).message)
+    return false
   }
 }
 
@@ -245,13 +256,29 @@ Deno.serve(async (req: Request) => {
       }
 
       // Vault write succeeded — mark account active
-      await supabaseAdmin
+      const { data: activatedRows, error: activateErr } = await supabaseAdmin
         .from('connected_accounts')
         .update({ status: 'active', updated_at: new Date().toISOString() })
         .eq('id', account.id)
+        .select('id')
+      if (activateErr || !activatedRows?.length) {
+        console.error('Mark active failed (reconnect):', JSON.stringify(activateErr))
+        throw new Error('mark_active_failed')
+      }
 
     } else {
       // === NEW CONNECTION PATH ===
+      // Check if an existing row exists (error/revoked) so we can reset backfill state on reactivation
+      const { data: existingRow } = await supabaseAdmin
+        .from('connected_accounts')
+        .select('id, status, lifecycle_version')
+        .eq('user_id', userId)
+        .eq('provider', 'google')
+        .eq('email_address', emailAddress)
+        .maybeSingle()
+
+      const isReactivation = existingRow?.status === 'error' || existingRow?.status === 'revoked'
+
       // Save account as 'error' first; update to 'active' only after vault write succeeds
       const { data: account, error: upsertError } = await supabaseAdmin
         .from('connected_accounts')
@@ -262,6 +289,15 @@ Deno.serve(async (req: Request) => {
           status: 'error',
           granted_scopes: 'openid email https://www.googleapis.com/auth/gmail.readonly',
           updated_at: new Date().toISOString(),
+          // Reset backfill state when reactivating an error/revoked account so the
+          // collector doesn't call history?startHistoryId=null after seeing backfill_complete=true
+          ...(isReactivation ? {
+            backfill_complete: false,
+            sync_cursor: null,
+            backfill_page_token: null,
+            backfill_start_history_id: null,
+            lifecycle_version: (existingRow.lifecycle_version ?? 0) + 1,
+          } : {}),
         }, {
           onConflict: 'user_id,provider,email_address',
           ignoreDuplicates: false,
@@ -305,17 +341,38 @@ Deno.serve(async (req: Request) => {
       }
 
       // Vault write succeeded — mark account active
-      await supabaseAdmin
+      const { data: activatedRows, error: activateErr } = await supabaseAdmin
         .from('connected_accounts')
         .update({ status: 'active', updated_at: new Date().toISOString() })
         .eq('id', account.id)
+        .select('id')
+      if (activateErr || !activatedRows?.length) {
+        console.error('Mark active failed (new connection):', JSON.stringify(activateErr))
+        throw new Error('mark_active_failed')
+      }
     }
 
   } catch (e) {
     // Best-effort revoke on any post-exchange abort path
-    await tryRevokeToken(tokens.refresh_token)
+    const revoked = await tryRevokeToken(tokens.refresh_token)
     const msg = (e as Error).message
     console.error('Post-exchange step failed, revoke attempted:', msg)
+
+    if (!revoked) {
+      // 5xx or network error — park the token in Vault so it can be cleaned up manually
+      const parkKey = `revoke_pending_${crypto.randomUUID()}`
+      const { error: parkErr } = await supabaseAdmin.rpc('vault_create_secret', {
+        secret: tokens.refresh_token,
+        name: parkKey,
+        description: `Pending revoke — token issued during failed OAuth callback (${msg})`,
+      })
+      if (parkErr) {
+        console.error('Failed to park unrevoked token:', JSON.stringify(parkErr))
+      } else {
+        console.error('Parked unrevoked token under Vault key:', parkKey)
+      }
+    }
+
     if (msg === 'email_mismatch') {
       return new Response('Email mismatch: reconnect must use the same Google account.', { status: 400 })
     }

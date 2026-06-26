@@ -254,6 +254,16 @@ Deno.serve(async (req: Request) => {
             if (rpcErr) { errors++; continue }
           }
           processed += pageMsgs.length
+          // Re-check status before writing cursor — disconnect/delete may have completed
+          const { data: statusCheck } = await supabaseAdmin
+            .from('connected_accounts')
+            .select('status')
+            .eq('id', account.id)
+            .single()
+          if (statusCheck?.status !== 'active') {
+            console.warn(`Account ${account.id} no longer active before backfill-complete update — skipping`)
+            continue
+          }
           const { error: updateErr } = await supabaseAdmin
             .from('connected_accounts')
             .update({
@@ -278,6 +288,16 @@ Deno.serve(async (req: Request) => {
             if (rpcErr) { errors++; continue }
           }
           processed += pageMsgs.length
+          // Re-check status before writing page state — disconnect/delete may have completed
+          const { data: statusCheck } = await supabaseAdmin
+            .from('connected_accounts')
+            .select('status')
+            .eq('id', account.id)
+            .single()
+          if (statusCheck?.status !== 'active') {
+            console.warn(`Account ${account.id} no longer active before page-token update — skipping`)
+            continue
+          }
           // Persist backfill_start_history_id atomically with page token
           // so the next run sees a consistent (startHistoryId, pageToken) pair.
           const { error: updateErr } = await supabaseAdmin

@@ -107,14 +107,6 @@ Deno.serve(async (req: Request) => {
     return Response.json({ error: 'Google revoke failed. Please try again.' }, { status: 502, headers: corsHeaders })
   }
 
-  // Delete Vault secret
-  const { error: vaultDeleteErr } = await supabaseAdmin
-    .rpc('vault_delete_secret', { secret_name: account.id })
-  if (vaultDeleteErr) {
-    console.error('Vault delete error:', JSON.stringify(vaultDeleteErr))
-    return Response.json({ error: 'Failed to delete vault secret' }, { status: 500, headers: corsHeaders })
-  }
-
   // Call lifecycle_disconnect RPC — atomic with version check
   const { data: disconnected, error: rpcErr } = await supabaseAdmin
     .rpc('lifecycle_disconnect', {
@@ -130,17 +122,19 @@ Deno.serve(async (req: Request) => {
   }
 
   if (!disconnected) {
-    // Version mismatch — reconnect raced. We already deleted the Vault secret.
-    // The reconnect wrote a new token; we must fetch and revoke it.
-    const { data: newToken } = await supabaseAdmin
-      .rpc('vault_get_secret', { secret_name: account.id })
-    if (newToken) {
-      await revokeGoogleToken(newToken)
-    }
+    // Version mismatch — reconnect raced. Do NOT delete Vault secret: reconnect stored a new token there.
     return Response.json(
-      { error: 'Account was reconnected concurrently. Please try again.' },
+      { error: 'reconnect_in_progress' },
       { status: 409, headers: corsHeaders },
     )
+  }
+
+  // RPC succeeded — safe to delete Vault secret (reconnect cannot write a new token anymore)
+  const { error: vaultDeleteErr } = await supabaseAdmin
+    .rpc('vault_delete_secret', { secret_name: account.id })
+  if (vaultDeleteErr) {
+    console.error('Vault delete error:', JSON.stringify(vaultDeleteErr))
+    return Response.json({ error: 'Failed to delete vault secret' }, { status: 500, headers: corsHeaders })
   }
 
   return Response.json({ success: true }, { headers: corsHeaders })

@@ -10,13 +10,14 @@ export function useAccounts() {
   })
 }
 
-/** Invalidates accounts, messages, and individual message caches after disconnect/delete */
+/** Invalidates and removes accounts, messages, and individual message caches after disconnect/delete */
 function useAccountsInvalidation() {
   const queryClient = useQueryClient()
   return () => {
     queryClient.invalidateQueries({ queryKey: ['accounts'] })
-    queryClient.invalidateQueries({ queryKey: ['messages'] })
-    queryClient.invalidateQueries({ queryKey: ['message'] })
+    // Remove (not just invalidate) cached messages so purged PII is not visible until refetch
+    queryClient.removeQueries({ queryKey: ['messages'] })
+    queryClient.removeQueries({ queryKey: ['message'] })
   }
 }
 

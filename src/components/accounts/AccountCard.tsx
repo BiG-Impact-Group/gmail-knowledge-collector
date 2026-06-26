@@ -27,6 +27,8 @@ function formatRelativeTime(dateStr: string | null): string {
 export default function AccountCard({ account }: Props) {
   const [showDisconnect, setShowDisconnect] = useState(false)
   const [showDelete, setShowDelete] = useState(false)
+  const [isReconnecting, setIsReconnecting] = useState(false)
+  const [reconnectError, setReconnectError] = useState<string | null>(null)
 
   const disconnectMutation = useDisconnectAccount()
   const deleteMutation = useDeleteAccount()
@@ -34,8 +36,16 @@ export default function AccountCard({ account }: Props) {
   const canReconnect = account.status === 'error' || account.status === 'revoked'
   const canDisconnect = account.status === 'active' || account.status === 'error'
 
-  function handleReconnect() {
-    reconnectAccount(account.id)
+  async function handleReconnect() {
+    setIsReconnecting(true)
+    setReconnectError(null)
+    try {
+      await reconnectAccount(account.id)
+    } catch (e) {
+      setReconnectError((e as Error).message ?? 'Reconnect failed. Please try again.')
+    } finally {
+      setIsReconnecting(false)
+    }
   }
 
   function handleDisconnectConfirm(purgeMessages: boolean) {
@@ -68,10 +78,17 @@ export default function AccountCard({ account }: Props) {
           <span className={styles.synced}>
             Last synced: {formatRelativeTime(account.last_synced_at)}
           </span>
+          {reconnectError && (
+            <span className={styles.reconnectError} role="alert">{reconnectError}</span>
+          )}
           <div className={styles.actions}>
             {canReconnect && (
-              <button className={styles.reconnect} onClick={handleReconnect}>
-                Reconnect
+              <button
+                className={styles.reconnect}
+                onClick={handleReconnect}
+                disabled={isReconnecting}
+              >
+                {isReconnecting ? 'Reconnecting…' : 'Reconnect'}
               </button>
             )}
             {canDisconnect && (
