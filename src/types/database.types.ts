@@ -255,6 +255,103 @@ export type Database = {
           },
         ]
       }
+      // --- Epic 06 (vector-store) hand-augmentation; parent regenerates from Remote post-migration ---
+      // Note: `embedding extensions.vector(384)` serializes to a string in generated types.
+      chunks: {
+        Row: {
+          chunk_index: number
+          content: string
+          created_at: string
+          document_id: string
+          embedding: string
+          id: string
+          source_version: string
+          user_id: string
+        }
+        Insert: {
+          chunk_index: number
+          content: string
+          created_at?: string
+          document_id: string
+          embedding: string
+          id?: string
+          source_version: string
+          user_id: string
+        }
+        Update: {
+          chunk_index?: number
+          content?: string
+          created_at?: string
+          document_id?: string
+          embedding?: string
+          id?: string
+          source_version?: string
+          user_id?: string
+        }
+        Relationships: [
+          {
+            foreignKeyName: "chunks_user_document_fk"
+            columns: ["user_id", "document_id"]
+            isOneToOne: false
+            referencedRelation: "documents"
+            referencedColumns: ["user_id", "id"]
+          },
+        ]
+      }
+      // --- Epic 06 (vector-store) hand-augmentation; parent regenerates from Remote post-migration ---
+      embedding_jobs: {
+        Row: {
+          attempts: number
+          chunk_count: number | null
+          claimed_at: string | null
+          created_at: string
+          document_id: string
+          id: string
+          last_error: string | null
+          source_version: string
+          status: string
+          truncated: boolean
+          updated_at: string
+          user_id: string
+        }
+        Insert: {
+          attempts?: number
+          chunk_count?: number | null
+          claimed_at?: string | null
+          created_at?: string
+          document_id: string
+          id?: string
+          last_error?: string | null
+          source_version: string
+          status?: string
+          truncated?: boolean
+          updated_at?: string
+          user_id: string
+        }
+        Update: {
+          attempts?: number
+          chunk_count?: number | null
+          claimed_at?: string | null
+          created_at?: string
+          document_id?: string
+          id?: string
+          last_error?: string | null
+          source_version?: string
+          status?: string
+          truncated?: boolean
+          updated_at?: string
+          user_id?: string
+        }
+        Relationships: [
+          {
+            foreignKeyName: "embedding_jobs_user_document_fk"
+            columns: ["user_id", "document_id"]
+            isOneToOne: false
+            referencedRelation: "documents"
+            referencedColumns: ["user_id", "id"]
+          },
+        ]
+      }
     }
     Views: {
       [_ in never]: never
@@ -317,6 +414,40 @@ export type Database = {
         Returns: undefined
       }
       enqueue_processing_jobs: { Args: never; Returns: undefined }
+      // --- Epic 06 (vector-store) hand-augmentation; parent regenerates from Remote post-migration ---
+      enqueue_embedding_jobs: { Args: never; Returns: undefined }
+      claim_embedding_jobs: {
+        Args: {
+          p_limit: number
+          p_max_attempts: number
+          p_stale_seconds: number
+        }
+        Returns: {
+          attempts: number
+          claimed_at: string
+          connected_account_id: string
+          document_id: string
+          drive_modified_time: string
+          job_id: string
+          lifecycle_version: number
+          user_id: string
+        }[]
+      }
+      complete_embedding_job: {
+        Args: {
+          p_attempts: number
+          p_chunks: Json
+          p_claimed_at: string
+          p_drive_modified_time: string
+          p_error: string
+          p_job_id: string
+          p_lifecycle_version: number
+          p_max_attempts: number
+          p_outcome: string
+          p_truncated: boolean
+        }
+        Returns: undefined
+      }
       get_vault_secret: { Args: { secret_name: string }; Returns: string }
       get_vault_secret_id: { Args: { secret_name: string }; Returns: string }
       lifecycle_delete: {
