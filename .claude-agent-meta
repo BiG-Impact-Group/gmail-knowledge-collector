@@ -1,3 +1,2 @@
 role: planner
-slug: epic-06-vector-store
-from_branch: test
+slug: epic-07-basic-rag

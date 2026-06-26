@@ -463,6 +463,20 @@ export type Database = {
         }
         Returns: boolean
       }
+      // EPIC 07 (basic-rag): hand-augmented for the match_chunks RPC so tsc passes ahead of the
+      // migration being applied. The parent regenerates database.types.ts via `npm run gen:types`
+      // after `supabase db push --linked`, which will overwrite this block with the generated form.
+      match_chunks: {
+        Args: { p_query_embedding: string; p_limit: number }
+        Returns: {
+          document_id: string
+          document_name: string
+          web_view_link: string
+          content: string
+          chunk_index: number
+          similarity: number
+        }[]
+      }
       reset_account_documents: {
         Args: { p_account_id: string; p_expected_version: number }
         Returns: undefined
