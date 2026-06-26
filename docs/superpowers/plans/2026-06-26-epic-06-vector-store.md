@@ -1,6 +1,6 @@
 # Epic 06 — vector-store
 
-**Status:** Rev 2 — post Codex plan review v1 (3 criticals + importants addressed)
+**Status:** Rev 3 — Codex plan review v2 zero criticals (gate passed). Rev 3 folds the 3 residual importants: non-null content version + strict equality everywhere (no NULL-version leak), explicit SQL chunk-dimension validation before delete/insert, p_truncated param on complete. Ready for builder.
 **Date:** 2026-06-26
 **Base branch:** `test` (Epics 03/04/05 merged). Build branch: `feature/epic-06-vector-store`.
 **Depends on:** Epic 05 (`documents.text_content` populated for `content_status='extracted'`).
@@ -14,7 +14,7 @@ Embed extracted document text **in-boundary** (Supabase Edge Runtime built-in `g
 
 ## Core correctness decisions (from review)
 
-- **Content version everywhere (Codex C1/C2).** A document's `drive_modified_time` is its content version. `embedding_jobs.source_version` and `chunks.source_version` both record the version they embedded. Enqueue/reopen only when the version is missing or changed; retrieval and cleanup key off version so **stale chunks are never returned and are purged**.
+- **Content version everywhere (Codex C1/C2).** A document's `drive_modified_time` is its content version. `embedding_jobs.source_version` and `chunks.source_version` record the version they embedded. **Only documents with a non-null `drive_modified_time` are embedded**, and all comparisons use strict `=` (never `IS NOT DISTINCT FROM`), so a NULL version can never make a stale chunk look current (Codex v2). `chunks.source_version` is `NOT NULL`. Enqueue/reopen only when the version changed; retrieval and cleanup key off strict version equality so **stale chunks are never returned and are purged**. (Drive returns `modifiedTime` for real files; the rare NULL-modifiedTime doc simply isn't embedded — documented, acceptable.)
 - **Embedding never regresses the document (Codex C3).** Neither `claim_embedding_jobs` cap-fail nor `complete_embedding_job` ever writes `documents` (no `content_status`/`text_content` mutation). Embedding is best-effort; the `/documents` viewer is unaffected by embedding failures.
 - **Reuse the FINAL Epic 05 lock discipline (Codex #4):** base `complete_embedding_job` on `20260627020001_complete_job_lock_order.sql` — unlocked id derivation, then `connected_accounts → documents → embedding_jobs` lease lock, lifecycle + content-version + `content_status='extracted'` rechecks — replacing only the outcome (chunk delete+insert).
 
@@ -32,7 +32,7 @@ CREATE TABLE IF NOT EXISTS chunks (
   id              uuid PRIMARY KEY DEFAULT gen_random_uuid(),
   user_id         uuid NOT NULL REFERENCES auth.users(id) ON DELETE CASCADE,
   document_id     uuid NOT NULL,
-  source_version  timestamptz,                 -- documents.drive_modified_time embedded (NULL ok)
+  source_version  timestamptz NOT NULL,        -- documents.drive_modified_time embedded (always non-null; strict = comparisons)
   chunk_index     integer NOT NULL,
   content         text NOT NULL,
   embedding       extensions.vector(384) NOT NULL,
@@ -70,6 +70,7 @@ INSERT INTO public.embedding_jobs (user_id, document_id, source_version)
 SELECT d.user_id, d.id, d.drive_modified_time
 FROM public.documents d
 WHERE d.content_status='extracted' AND d.text_content IS NOT NULL
+  AND d.drive_modified_time IS NOT NULL   -- only embed docs with a real content version (Codex v2)
 ON CONFLICT (document_id) DO UPDATE
   SET status='pending', attempts=0, claimed_at=NULL, last_error=NULL,
       source_version=EXCLUDED.source_version, updated_at=now()
@@ -84,15 +85,15 @@ WHERE NOT EXISTS (
   SELECT 1 FROM public.documents d
   WHERE d.id = c.document_id
     AND d.content_status = 'extracted'
-    AND d.drive_modified_time IS NOT DISTINCT FROM c.source_version
+    AND d.drive_modified_time = c.source_version   -- strict equality; both non-null
 );
 ```
 (FK cascade already removes chunks when a document/account is deleted; this also clears chunks for docs that went `needs_processing`/`needs_ocr`/`skipped` or whose content changed.)
 
 **`claim_embedding_jobs(p_limit, p_stale_seconds, p_max_attempts)`** — like `claim_processing_jobs` BUT cap-fail touches **only `embedding_jobs`** (never documents — Codex C3). `FOR UPDATE OF pj SKIP LOCKED`; eligibility = active google_drive account + `d.content_status='extracted'` + `(pending OR stale processing under max)`. Returns `(job_id, document_id, user_id, attempts, claimed_at, connected_account_id, lifecycle_version, drive_modified_time)`. No text, no file name.
 
-**`complete_embedding_job(p_job_id, p_claimed_at, p_attempts, p_lifecycle_version, p_drive_modified_time, p_outcome, p_chunks jsonb, p_error, p_max_attempts)`** — based on `complete_job_lock_order.sql` (account→document→job locks; lease + lifecycle_version + `drive_modified_time` + `content_status='extracted'` rechecks). **Never writes `documents`.** Outcomes:
-- `'done'`: validate `p_chunks` in SQL first (Codex #6) — `jsonb_array_length` ≤ `MAX_CHUNKS`, each element has integer `chunk_index`, non-empty `content` within a length cap, and a 384-element `embedding`; cast `(elem->>'embedding')::extensions.vector` and rely on the `vector(384)` column to reject wrong dimension. On validation failure → job `failed`, `last_error='invalid_chunks'`, return (no document write). On success: `DELETE FROM chunks WHERE document_id=v_doc; INSERT` the new chunks with `source_version = p_drive_modified_time`; set job `done`, `chunk_count`, `truncated`.
+**`complete_embedding_job(p_job_id, p_claimed_at, p_attempts, p_lifecycle_version, p_drive_modified_time, p_outcome, p_chunks jsonb, p_truncated boolean, p_error, p_max_attempts)`** — based on `complete_job_lock_order.sql` (account→document→job locks; lease + lifecycle_version + strict `drive_modified_time =` + `content_status='extracted'` rechecks). **Never writes `documents`.** Note `p_truncated` is an explicit param (Codex #11; `chunk_count` is derived from `jsonb_array_length`). Outcomes:
+- `'done'`: **validate `p_chunks` fully in SQL BEFORE any delete/insert (Codex v2 #6)** — `jsonb_array_length(p_chunks) BETWEEN 1 AND MAX_CHUNKS`; for every element assert integer `chunk_index`, non-empty `content` ≤ a length cap, and `jsonb_array_length(elem->'embedding') = 384`. If any check fails → job `failed`, `last_error='invalid_chunks'`, **return without touching chunks/documents** (don't rely on the `vector(384)` cast to throw mid-insert and abort the txn). On success: `DELETE FROM chunks WHERE document_id=v_doc;` then `INSERT` each chunk with `embedding = (elem->>'embedding')::extensions.vector` and `source_version = p_drive_modified_time`; set job `done`, `chunk_count = jsonb_array_length(p_chunks)`, `truncated = p_truncated`.
 - `'retry'`: if `attempts >= max` → job `failed`; else job `pending`, `claimed_at=NULL`. (Document untouched either way.)
 
 ### Migration 4 — `embedder_cron`
@@ -103,7 +104,7 @@ CRON_SECRET bearer. Calibrated caps (Codex #5): `MAX_JOBS_PER_RUN=2`, `MAX_CHUNK
 1. Read `documents.text_content` (truncate to `MAX_CONTENT_CHARS`).
 2. `chunkText(text, {...})` → ≤ `MAX_CHUNKS_PER_DOC` chunks (excess truncated → set `truncated=true`).
 3. For each chunk: **deadline-check before each `model.run`** (Codex #5); if the deadline is near, `complete(..., 'retry', 'embedding_deadline')` and stop. Else embed.
-4. `complete_embedding_job(..., 'done', chunks=[{chunk_index, content, embedding}], chunk_count, truncated)` with lease+lifecycle_version+drive_modified_time. Check the RPC error; don't count a failed completion as success.
+4. `complete_embedding_job(..., 'done', p_chunks=[{chunk_index, content, embedding}], p_truncated)` with lease+lifecycle_version+drive_modified_time. Check the RPC error; don't count a failed completion as success.
 5. Return `{ enqueued, claimed, embedded_docs, total_chunks, retried, complete_errors }`.
 
 **Pure helper** `src/lib/chunking.ts`: `chunkText(text, {targetChars, overlapChars, maxChunks})` → `string[]`, unit-tested.
@@ -114,7 +115,7 @@ Retrieval MUST filter to current, extracted content so stale chunks are never re
 SELECT c.content, c.document_id
 FROM chunks c JOIN documents d ON d.id = c.document_id
 WHERE d.content_status = 'extracted'
-  AND c.source_version IS NOT DISTINCT FROM d.drive_modified_time
+  AND c.source_version = d.drive_modified_time   -- strict equality; both non-null
 ORDER BY c.embedding <#> $1   -- $1 = query embedding (gte-small, normalized)
 LIMIT $2;
 ```
