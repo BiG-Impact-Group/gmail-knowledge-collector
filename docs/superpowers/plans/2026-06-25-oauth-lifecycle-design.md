@@ -15,6 +15,7 @@
 | 2 | 2026-06-25 | Codex plan review v1 — fixed constraint name, revoke error handling, vault_delete_secret grants, reconnect JWT binding, GET→POST initiate, callback conflict target, test gaps, rollback note, safety criteria |
 | 3 | 2026-06-25 | Codex plan review v2 — reconnect state reset, collector race real fix, Vault-before-row delete ordering, migration split for zero-downtime, cache invalidation, error-status disconnect, CORS/validation note, handoff path |
 | 4 | 2026-06-25 | Codex plan review v3 — mismatch revoke on reconnect, atomic collector write guard, disconnect status ordering (revoke-then-mark), gen:types after every migration |
+| 5 | 2026-06-25 | Codex plan review v4 — pg_advisory_xact_lock for collector/disconnect race, gen:types after Migration 1b |
 
 ---
 
@@ -183,7 +184,7 @@ GRANT EXECUTE ON FUNCTION vault_delete_secret(text) TO service_role;
 7. If `purgeMessages === true`: `DELETE FROM messages WHERE connected_account_id = accountId AND EXISTS (SELECT 1 FROM connected_accounts WHERE id = accountId AND status = 'revoked')` — atomic guard: only purge if status is confirmed revoked
 8. Return `200 { success: true }`
 
-**Collector race (atomic guard):** EU-26-9 updates the collector's message upsert to include `WHERE connected_account_id = $1 AND EXISTS (SELECT 1 FROM connected_accounts WHERE id = $1 AND status = 'active')` — if the account is revoked between check and write, the upsert produces zero rows. This is atomic at the DB level; no advisory lock needed.
+**Collector race (advisory lock):** EU-26-9 wraps the collector's per-account write block and the disconnect/delete status-flip + purge/delete block in a shared PostgreSQL advisory lock keyed by account ID: `SELECT pg_advisory_xact_lock(hashtext(account_id::text))`. This is a transaction-level lock — acquired inside a BEGIN/COMMIT block, released automatically on commit/rollback. The collector holds the lock while writing messages and updating the cursor; disconnect/delete hold it while marking revoked and purging/deleting. If both try to run concurrently, one blocks until the other commits. No schema changes required — advisory locks are built in to PostgreSQL.
 
 ### New function: `google-account-delete`
 
@@ -346,7 +347,7 @@ Migration 1 is split into 1a and 1b to eliminate the deployment window where the
 1. **Migration 1a** — ADD `UNIQUE (user_id, provider, email_address)` (old constraint still present) → confirm Remote column → `npm run gen:types`
 2. **Migration 2** — `vault_delete_secret` helper → confirm Remote column → `npm run gen:types` (invariant: run after every migration)
 3. **EU-26-8** — Deploy `google-oauth-callback` with updated conflict target (`user_id,provider,email_address`) and reconnect email-match validation
-4. **Migration 1b** — DROP `connected_accounts_user_email_unique` (now safe — callback already uses new target) → confirm Remote column
+4. **Migration 1b** — DROP `connected_accounts_user_email_unique` (now safe — callback already uses new target) → confirm Remote column → `npm run gen:types`
 5. Deploy `google-account-disconnect` edge function
 6. Deploy `google-account-delete` edge function
 7. Deploy modified `google-oauth-initiate` (reconnect support)
