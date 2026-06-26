@@ -25,6 +25,7 @@ interface StatePayloadInput {
   reconnect_account_id?: string
   provider: string
   redirect_path: string
+  expected_lifecycle_version?: number
 }
 
 async function buildStateJwt(payload: StatePayloadInput, stateSecret: string): Promise<string> {
@@ -89,11 +90,14 @@ Deno.serve(async (req: Request) => {
   }
 
   // If reconnect, verify account ownership AND that it is a Drive account before issuing redirect
+  // Capture lifecycle_version at initiation (signed into state) so the callback can detect a
+  // disconnect/delete that happens between this initiation and the callback.
+  let expectedLifecycleVersion: number | undefined
   if (reconnectAccountId) {
     const supabaseAdmin = createClient(supabaseUrl, serviceRoleKey)
     const { data: account, error: fetchErr } = await supabaseAdmin
       .from('connected_accounts')
-      .select('id, provider')
+      .select('id, provider, lifecycle_version')
       .eq('id', reconnectAccountId)
       .eq('user_id', user.id)
       .single()
@@ -101,6 +105,7 @@ Deno.serve(async (req: Request) => {
     if (fetchErr || !account || account.provider !== 'google_drive') {
       return Response.json({ error: 'Account not found or not owned by this user' }, { status: 404, headers: corsHeaders })
     }
+    expectedLifecycleVersion = account.lifecycle_version
   }
 
   const nonce = crypto.randomUUID()
@@ -110,7 +115,9 @@ Deno.serve(async (req: Request) => {
     exp: Math.floor(Date.now() / 1000) + 300,
     provider: 'google_drive',
     redirect_path: '/documents',
-    ...(reconnectAccountId ? { reconnect_account_id: reconnectAccountId } : {}),
+    ...(reconnectAccountId
+      ? { reconnect_account_id: reconnectAccountId, expected_lifecycle_version: expectedLifecycleVersion }
+      : {}),
   }
   const state = await buildStateJwt(statePayload, stateSecret)
 

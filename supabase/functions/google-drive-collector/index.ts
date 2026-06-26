@@ -440,7 +440,10 @@ Deno.serve(async (req: Request) => {
 
           if (res.status === 410) {
             // Cursor unrecoverable and we may have missed deletions — full reset (locked).
-            await supabaseAdmin.rpc('reset_account_documents', { p_account_id: account.id })
+            // If the reset RPC fails, count it and leave state untouched so the next run
+            // retries (cursor is not advanced).
+            const { error: resetErr } = await supabaseAdmin.rpc('reset_account_documents', { p_account_id: account.id })
+            if (resetErr) errors++
             break
           }
           if (!res.ok) { errors++; break }
@@ -463,10 +466,13 @@ Deno.serve(async (req: Request) => {
           }
 
           if (removedIds.length > 0) {
-            await supabaseAdmin.rpc('delete_account_documents', {
+            // Deletions must succeed before the cursor advances — otherwise a failed delete
+            // would leave purged Drive files visible forever once the cursor moves past them.
+            const { error: delErr } = await supabaseAdmin.rpc('delete_account_documents', {
               p_account_id: account.id,
               p_file_ids: removedIds,
             })
+            if (delErr) { errors++; break }  // do NOT advance cursor; retry this page next run
           }
 
           const upsertDocs: DocRow[] = []

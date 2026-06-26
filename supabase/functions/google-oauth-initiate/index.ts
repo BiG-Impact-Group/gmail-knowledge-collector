@@ -27,6 +27,7 @@ interface StatePayloadInput {
   exp: number
   reconnect_account_id?: string
   provider?: string
+  expected_lifecycle_version?: number
 }
 
 async function buildStateJwt(payload: StatePayloadInput, stateSecret: string): Promise<string> {
@@ -90,12 +91,15 @@ Deno.serve(async (req: Request) => {
     // No body or invalid JSON — treat as new connection
   }
 
-  // If reconnect, verify account ownership before issuing redirect
+  // If reconnect, verify account ownership before issuing redirect and capture the
+  // lifecycle_version NOW so the callback can detect a disconnect/delete that happens
+  // between this initiation and the callback (signed into state, tamper-proof).
+  let expectedLifecycleVersion: number | undefined
   if (reconnectAccountId) {
     const supabaseAdmin = createClient(supabaseUrl, serviceRoleKey)
     const { data: account, error: fetchErr } = await supabaseAdmin
       .from('connected_accounts')
-      .select('id, provider')
+      .select('id, provider, lifecycle_version')
       .eq('id', reconnectAccountId)
       .eq('user_id', user.id)
       .single()
@@ -103,6 +107,7 @@ Deno.serve(async (req: Request) => {
     if (fetchErr || !account) {
       return Response.json({ error: 'Account not found or not owned by this user' }, { status: 404, headers: corsHeaders })
     }
+    expectedLifecycleVersion = account.lifecycle_version
   }
 
   const nonce = crypto.randomUUID()
@@ -110,7 +115,9 @@ Deno.serve(async (req: Request) => {
     user_id: user.id,
     nonce,
     exp: Math.floor(Date.now() / 1000) + 300,
-    ...(reconnectAccountId ? { reconnect_account_id: reconnectAccountId, provider: 'google' } : {}),
+    ...(reconnectAccountId
+      ? { reconnect_account_id: reconnectAccountId, provider: 'google', expected_lifecycle_version: expectedLifecycleVersion }
+      : {}),
   }
   const state = await buildStateJwt(statePayload, stateSecret)
 

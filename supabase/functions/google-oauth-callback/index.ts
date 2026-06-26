@@ -37,6 +37,7 @@ interface StatePayload {
   reconnect_account_id?: string
   provider?: string        // 'google' | 'google_drive' — defaults to 'google'
   redirect_path?: string   // e.g. '/documents' — defaults to '/accounts'
+  expected_lifecycle_version?: number  // signed at reconnect-initiate; guards the reconnect update
 }
 
 async function verifyStateJwt(token: string, secret: string): Promise<StatePayload> {
@@ -180,6 +181,9 @@ Deno.serve(async (req: Request) => {
 
   if (!tokens.refresh_token) {
     console.error('No refresh_token in response. Tokens keys:', Object.keys(tokens))
+    // No refresh token to store, but the access token is a live grant — revoke it so we
+    // never abort after token exchange while leaving a usable credential active.
+    if (tokens.access_token) await tryRevokeToken(tokens.access_token)
     return new Response('No refresh token returned. Revoke access at myaccount.google.com/permissions and try again.', { status: 400 })
   }
 
@@ -225,9 +229,11 @@ Deno.serve(async (req: Request) => {
         throw new Error('email_mismatch')
       }
 
-      // Update the row by ID, guarded on lifecycle_version to detect concurrent disconnect/delete.
-      // If lifecycle_disconnect/lifecycle_delete ran between initiate and callback, they increment
-      // lifecycle_version; this .eq() guard produces 0 rows → throws concurrent_delete below.
+      // Guard against the lifecycle_version captured at INITIATE time (signed into state),
+      // falling back to the current row version for older states without the field. This
+      // detects a disconnect/delete that ran ANY time between initiation and this callback,
+      // not just one racing this transaction. A mismatch → 0 rows → concurrent_delete (token revoked).
+      const guardVersion = statePayload.expected_lifecycle_version ?? existingAccount.lifecycle_version
       const { data: updatedRows, error: updateErr } = await supabaseAdmin
         .from('connected_accounts')
         .update({
@@ -237,12 +243,12 @@ Deno.serve(async (req: Request) => {
           backfill_page_token: null,
           backfill_start_history_id: null,
           sync_cursor: null,
-          lifecycle_version: existingAccount.lifecycle_version + 1,
+          lifecycle_version: guardVersion + 1,
           updated_at: new Date().toISOString(),
         })
         .eq('id', reconnectAccountId)
         .eq('user_id', userId)
-        .eq('lifecycle_version', existingAccount.lifecycle_version)
+        .eq('lifecycle_version', guardVersion)
         .select('id')
 
       if (updateErr) {
