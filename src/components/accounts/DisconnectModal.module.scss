@@ -1,0 +1,102 @@
+.overlay {
+  position: fixed;
+  inset: 0;
+  background: rgb(0 0 0 / 50%);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  z-index: 100;
+}
+
+.modal {
+  background: var(--color-surface, #fff);
+  border-radius: 8px;
+  padding: 24px;
+  max-width: 480px;
+  width: 100%;
+  margin: 16px;
+  box-shadow: 0 4px 24px rgb(0 0 0 / 15%);
+}
+
+.heading {
+  font-size: 1.125rem;
+  font-weight: 600;
+  margin: 0 0 8px;
+}
+
+.subtext {
+  font-size: 0.875rem;
+  color: var(--color-text-secondary, #666);
+  margin: 0 0 20px;
+  line-height: 1.5;
+}
+
+.options {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  margin-bottom: 24px;
+}
+
+.option {
+  display: flex;
+  align-items: flex-start;
+  gap: 10px;
+  cursor: pointer;
+
+  input[type='radio'] {
+    margin-top: 2px;
+    flex-shrink: 0;
+  }
+}
+
+.optionText {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+
+  strong {
+    font-size: 0.875rem;
+  }
+}
+
+.optionHint {
+  font-size: 0.8rem;
+  color: var(--color-text-secondary, #666);
+}
+
+.actions {
+  display: flex;
+  gap: 12px;
+  justify-content: flex-end;
+}
+
+.cancelButton {
+  padding: 8px 16px;
+  border-radius: 6px;
+  border: 1px solid var(--color-border, #ddd);
+  background: transparent;
+  cursor: pointer;
+  font-size: 0.875rem;
+
+  &:disabled {
+    opacity: 0.5;
+    cursor: not-allowed;
+  }
+}
+
+.confirmButton {
+  padding: 8px 16px;
+  border-radius: 6px;
+  border: none;
+  background: var(--color-danger, #dc2626);
+  color: #fff;
+  cursor: pointer;
+  font-size: 0.875rem;
+  font-weight: 500;
+
+  &:disabled {
+    opacity: 0.5;
+    cursor: not-allowed;
+  }
+}

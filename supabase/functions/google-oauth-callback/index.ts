@@ -5,11 +5,13 @@
 //   - Store refresh tokens in Supabase Vault only (never return to browser)
 //   - Mark connected_account status 'error' before vault write, 'active' only on success
 //   - Never log token values — log only error codes
+//   - Every abort path after token exchange must attempt to revoke the new token
 
 import { createClient } from 'https://esm.sh/@supabase/supabase-js@2'
 
 const REDIRECT_URI = 'https://ybgtzyutbvwfhgtlmnah.supabase.co/functions/v1/google-oauth-callback'
 const TOKEN_URL = 'https://oauth2.googleapis.com/token'
+const GOOGLE_REVOKE_URL = 'https://oauth2.googleapis.com/revoke'
 
 function base64urlDecode(str: string): string {
   const base64 = str.replace(/-/g, '+').replace(/_/g, '/')
@@ -22,6 +24,8 @@ interface StatePayload {
   user_id: string
   nonce: string
   exp: number
+  reconnect_account_id?: string
+  provider?: string
 }
 
 async function verifyStateJwt(token: string, secret: string): Promise<StatePayload> {
@@ -56,6 +60,19 @@ async function fetchEmailFromUserinfo(accessToken: string): Promise<string> {
   if (!data.email_verified) throw new Error('Email not verified')
   if (!data.email) throw new Error('No email in userinfo')
   return data.email
+}
+
+/** Best-effort token revoke — logs failure but never throws */
+async function tryRevokeToken(refreshToken: string): Promise<void> {
+  try {
+    await fetch(GOOGLE_REVOKE_URL, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+      body: new URLSearchParams({ token: refreshToken }),
+    })
+  } catch (e) {
+    console.error('Best-effort revoke failed:', (e as Error).message)
+  }
 }
 
 Deno.serve(async (req: Request) => {
@@ -132,73 +149,181 @@ Deno.serve(async (req: Request) => {
     return new Response('No refresh token returned. Revoke access at myaccount.google.com/permissions and try again.', { status: 400 })
   }
 
-  let emailAddress: string
+  // All post-token-exchange steps are wrapped in try/catch.
+  // On any failure, attempt to revoke the newly issued token before returning error.
   try {
-    emailAddress = await fetchEmailFromUserinfo(tokens.access_token)
+    let emailAddress: string
+    try {
+      emailAddress = await fetchEmailFromUserinfo(tokens.access_token)
+    } catch (e) {
+      console.error('Failed to fetch email from userinfo:', e)
+      throw new Error('fetch_userinfo_failed')
+    }
+
+    const userId = statePayload.user_id
+    const reconnectAccountId = statePayload.reconnect_account_id
+
+    if (reconnectAccountId) {
+      // === RECONNECT PATH ===
+      // Fetch the existing account to verify email match and get current state
+      const { data: existingAccount, error: fetchErr } = await supabaseAdmin
+        .from('connected_accounts')
+        .select('id, email_address, lifecycle_version')
+        .eq('id', reconnectAccountId)
+        .eq('user_id', userId)
+        .single()
+
+      if (fetchErr || !existingAccount) {
+        console.error('Reconnect: account not found or not owned')
+        throw new Error('account_not_found')
+      }
+
+      // Email must match the account being reconnected
+      if (existingAccount.email_address !== emailAddress) {
+        console.error('Reconnect: email mismatch — expected account email, got different address')
+        throw new Error('email_mismatch')
+      }
+
+      // Update the row by ID (not email upsert — detect concurrent delete)
+      const { data: updatedRows, error: updateErr } = await supabaseAdmin
+        .from('connected_accounts')
+        .update({
+          status: 'error', // will be set active after vault write
+          granted_scopes: 'openid email https://www.googleapis.com/auth/gmail.readonly',
+          backfill_complete: false,
+          backfill_page_token: null,
+          backfill_start_history_id: null,
+          sync_cursor: null,
+          lifecycle_version: existingAccount.lifecycle_version + 1,
+          updated_at: new Date().toISOString(),
+        })
+        .eq('id', reconnectAccountId)
+        .eq('user_id', userId)
+        .select('id')
+
+      if (updateErr) {
+        console.error('Reconnect update error:', JSON.stringify(updateErr))
+        throw new Error('update_failed')
+      }
+
+      if (!updatedRows || updatedRows.length === 0) {
+        // Row was deleted by a concurrent lifecycle_delete
+        console.error('Reconnect: row deleted concurrently — 0 rows updated')
+        throw new Error('concurrent_delete')
+      }
+
+      const account = updatedRows[0]
+
+      // Write new refresh token to Vault
+      const { data: existingSecretId, error: vaultLookupError } = await supabaseAdmin
+        .rpc('get_vault_secret_id', { secret_name: account.id })
+
+      if (vaultLookupError) {
+        console.error('Vault lookup error:', JSON.stringify(vaultLookupError))
+        throw new Error('vault_lookup_failed')
+      }
+
+      if (existingSecretId) {
+        const { error: updateVaultErr } = await supabaseAdmin.rpc('vault_update_secret', {
+          secret_id: existingSecretId,
+          new_secret: tokens.refresh_token,
+        })
+        if (updateVaultErr) {
+          console.error('Vault update error:', JSON.stringify(updateVaultErr))
+          throw new Error('vault_update_failed')
+        }
+      } else {
+        const { error: createErr } = await supabaseAdmin.rpc('vault_create_secret', {
+          secret: tokens.refresh_token,
+          name: account.id,
+          description: `OAuth refresh token for ${emailAddress}`,
+        })
+        if (createErr) {
+          console.error('Vault create error:', JSON.stringify(createErr))
+          throw new Error('vault_create_failed')
+        }
+      }
+
+      // Vault write succeeded — mark account active
+      await supabaseAdmin
+        .from('connected_accounts')
+        .update({ status: 'active', updated_at: new Date().toISOString() })
+        .eq('id', account.id)
+
+    } else {
+      // === NEW CONNECTION PATH ===
+      // Save account as 'error' first; update to 'active' only after vault write succeeds
+      const { data: account, error: upsertError } = await supabaseAdmin
+        .from('connected_accounts')
+        .upsert({
+          user_id: userId,
+          provider: 'google',
+          email_address: emailAddress,
+          status: 'error',
+          granted_scopes: 'openid email https://www.googleapis.com/auth/gmail.readonly',
+          updated_at: new Date().toISOString(),
+        }, {
+          onConflict: 'user_id,provider,email_address',
+          ignoreDuplicates: false,
+        })
+        .select('id')
+        .single()
+
+      if (upsertError || !account) {
+        console.error('Upsert error:', JSON.stringify(upsertError))
+        throw new Error('upsert_failed')
+      }
+
+      // Store refresh token in Vault keyed by account id
+      const { data: existingSecretId, error: vaultLookupError } = await supabaseAdmin
+        .rpc('get_vault_secret_id', { secret_name: account.id })
+
+      if (vaultLookupError) {
+        console.error('Vault lookup error:', JSON.stringify(vaultLookupError))
+        throw new Error('vault_lookup_failed')
+      }
+
+      if (existingSecretId) {
+        const { error: updateErr } = await supabaseAdmin.rpc('vault_update_secret', {
+          secret_id: existingSecretId,
+          new_secret: tokens.refresh_token,
+        })
+        if (updateErr) {
+          console.error('Vault update error:', JSON.stringify(updateErr))
+          throw new Error('vault_update_failed')
+        }
+      } else {
+        const { error: createErr } = await supabaseAdmin.rpc('vault_create_secret', {
+          secret: tokens.refresh_token,
+          name: account.id,
+          description: `OAuth refresh token for ${emailAddress}`,
+        })
+        if (createErr) {
+          console.error('Vault create error:', JSON.stringify(createErr))
+          throw new Error('vault_create_failed')
+        }
+      }
+
+      // Vault write succeeded — mark account active
+      await supabaseAdmin
+        .from('connected_accounts')
+        .update({ status: 'active', updated_at: new Date().toISOString() })
+        .eq('id', account.id)
+    }
+
   } catch (e) {
-    console.error('Failed to fetch email from userinfo:', e)
-    return new Response('Failed to read account email', { status: 500 })
-  }
-
-  const userId = statePayload.user_id
-
-  // Save account as 'error' first; update to 'active' only after vault write succeeds
-  const { data: account, error: upsertError } = await supabaseAdmin
-    .from('connected_accounts')
-    .upsert({
-      user_id: userId,
-      provider: 'google',
-      email_address: emailAddress,
-      status: 'error',
-      granted_scopes: 'openid email https://www.googleapis.com/auth/gmail.readonly',
-      updated_at: new Date().toISOString(),
-    }, {
-      onConflict: 'user_id,email_address',
-      ignoreDuplicates: false,
-    })
-    .select('id')
-    .single()
-
-  if (upsertError || !account) {
-    console.error('Upsert error:', JSON.stringify(upsertError))
-    return new Response('Failed to save account', { status: 500 })
-  }
-
-  // Store refresh token in Vault keyed by account id
-  const { data: existingSecretId, error: vaultLookupError } = await supabaseAdmin
-    .rpc('get_vault_secret_id', { secret_name: account.id })
-
-  if (vaultLookupError) {
-    console.error('Vault lookup error:', JSON.stringify(vaultLookupError))
-    return new Response('Failed to access vault', { status: 500 })
-  }
-
-  if (existingSecretId) {
-    const { error: updateErr } = await supabaseAdmin.rpc('vault_update_secret', {
-      secret_id: existingSecretId,
-      new_secret: tokens.refresh_token,
-    })
-    if (updateErr) {
-      console.error('Vault update error:', JSON.stringify(updateErr))
-      return new Response('Failed to update vault secret', { status: 500 })
+    // Best-effort revoke on any post-exchange abort path
+    await tryRevokeToken(tokens.refresh_token)
+    const msg = (e as Error).message
+    console.error('Post-exchange step failed, revoke attempted:', msg)
+    if (msg === 'email_mismatch') {
+      return new Response('Email mismatch: reconnect must use the same Google account.', { status: 400 })
     }
-  } else {
-    const { error: createErr } = await supabaseAdmin.rpc('vault_create_secret', {
-      secret: tokens.refresh_token,
-      name: account.id,
-      description: `OAuth refresh token for ${emailAddress}`,
-    })
-    if (createErr) {
-      console.error('Vault create error:', JSON.stringify(createErr))
-      return new Response('Failed to store vault secret', { status: 500 })
+    if (msg === 'concurrent_delete') {
+      return new Response('Account was deleted concurrently. Please reconnect from scratch.', { status: 400 })
     }
+    return new Response('OAuth callback failed. Please try again.', { status: 500 })
   }
-
-  // Vault write succeeded — mark account active
-  await supabaseAdmin
-    .from('connected_accounts')
-    .update({ status: 'active', updated_at: new Date().toISOString() })
-    .eq('id', account.id)
 
   // access_token is ephemeral — never stored
   return Response.redirect(`${siteUrl}/accounts`, 302)
