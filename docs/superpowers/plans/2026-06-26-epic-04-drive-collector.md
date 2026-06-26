@@ -1,6 +1,6 @@
 # Epic 04 Design: drive-collector
 
-**Status:** Rev 4 — post Codex plan review v3 (1 new critical [purge-race RPC] + 2 importants + 1 partial addressed; v1/v2 findings resolved in Rev 2/3)  
+**Status:** Rev 5 — post Codex plan review v4 (RPC-only write path made explicit; delete/reset status-checked; reconnect provider-mismatch guard; RPC payload chunking; Content-Length pre-check). v1–v3 findings resolved in Rev 2–4.  
 **Date:** 2026-06-26  
 **Builder base branch:** `feature/epic-03-oauth-lifecycle` (stacked; merges when Epic 03 lands in `test`)  
 **Build branch:** `feature/epic-04-drive-collector`
@@ -284,6 +284,11 @@ LANGUAGE plpgsql SECURITY DEFINER SET search_path = public
 AS $$
 BEGIN
   PERFORM pg_advisory_xact_lock(hashtext(p_account_id::text));
+  -- Only act while the account is active. If the user disconnected with purge=false
+  -- (status='revoked'), a stale in-flight collector must NOT delete kept documents (Codex v4).
+  IF NOT EXISTS (SELECT 1 FROM connected_accounts WHERE id = p_account_id AND status = 'active') THEN
+    RETURN;
+  END IF;
   DELETE FROM documents
     WHERE connected_account_id = p_account_id
       AND drive_file_id = ANY(p_file_ids);
@@ -302,6 +307,11 @@ LANGUAGE plpgsql SECURITY DEFINER SET search_path = public
 AS $$
 BEGIN
   PERFORM pg_advisory_xact_lock(hashtext(p_account_id::text));
+  -- Only reset while active — a disconnected account's data must be left to the
+  -- lifecycle path, not wiped by a stale collector (Codex v4).
+  IF NOT EXISTS (SELECT 1 FROM connected_accounts WHERE id = p_account_id AND status = 'active') THEN
+    RETURN;
+  END IF;
   DELETE FROM documents WHERE connected_account_id = p_account_id;
   UPDATE connected_accounts
     SET backfill_complete = false, sync_cursor = NULL, backfill_page_token = NULL, updated_at = now()
@@ -404,7 +414,7 @@ return Response.redirect(`${siteUrl}${redirectPath}`, 302)
 
 **Change 3 — Reconnect path provider guard:**
 
-The reconnect path fetches the existing account by ID; `provider` on the row is unchanged. But `granted_scopes` is currently hardcoded to Gmail in the reconnect update — switch it to the `grantedScopes` derived from the row's provider (fetch `provider` in the existing-account select, map via `PROVIDER_SCOPES`).
+The reconnect path fetches the existing account by ID. Fetch its `provider` and **reject a provider mismatch** between the state JWT and the existing row (Codex v4): if `statePayload.provider ?? 'google'` ≠ `existingAccount.provider`, throw `provider_mismatch` and abort (revoke the freshly issued token via the existing abort path). This prevents a Gmail reconnect from overwriting a Drive account's tokens/scopes or vice-versa. Then derive `granted_scopes` from the row's provider via `PROVIDER_SCOPES` (it is currently hardcoded to Gmail).
 
 **Backward compatibility:** `statePayload.provider` optional → defaults to `'google'`. `redirect_path` optional → defaults to `'/accounts'`. Existing Gmail initiations keep working unchanged.
 
@@ -628,10 +638,16 @@ This removes the mid-page-skip/reprocess-forever hazard: a persisted token alway
 
 ```typescript
 async function readBounded(res: Response, maxBytes = 500_000): Promise<string> {
+  // Pre-check Content-Length: if the server declares a size far over the cap, don't even
+  // buffer it — signal the caller to mark the file needs_processing instead (Codex v4).
+  const declared = Number(res.headers.get('content-length') ?? '0')
+  if (declared > maxBytes * 10) {            // e.g. > 5 MB → too big to extract inline
+    await res.body?.cancel()
+    throw new Error('content_too_large')      // caller sets content_status='needs_processing'
+  }
   const reader = res.body?.getReader()
   if (!reader) {
-    // No stream reader available — read as ArrayBuffer and hard-cap the BYTES before decode,
-    // never the post-decode string (avoids buffering an unbounded body via res.text()).
+    // Deno's fetch always provides res.body; this fallback is defensive. Cap bytes before decode.
     const buf = new Uint8Array(await res.arrayBuffer())
     return new TextDecoder().decode(buf.subarray(0, maxBytes))
   }
@@ -652,24 +668,31 @@ async function readBounded(res: Response, maxBytes = 500_000): Promise<string> {
 
 The byte cap is enforced *before* accumulation, so memory never exceeds `maxBytes` regardless of chunk sizes, and the fallback path reads an `ArrayBuffer` capped at decode time rather than buffering an unbounded string. Unit-test (Codex v2 #7): asserts it stops at the cap, trims an oversized final chunk, and cancels the stream.
 
-**Upsert to `documents`:**
+**Document row shape (built per file, then passed to the `collect_account_documents` RPC — NEVER written via a direct `.from('documents').upsert()`; all writes go through the advisory-locked RPC, Codex v4):**
 
 ```typescript
-await supabaseAdmin.from('documents').upsert({
-  connected_account_id: account.id,
+// Build the row object only; the RPC performs the atomic, status-checked upsert.
+const docRow = {
   user_id: account.user_id,
   drive_file_id: file.id,
   name: file.name,
   mime_type: file.mimeType,
   web_view_link: file.webViewLink ?? null,
-  size_bytes: file.size ? parseInt(file.size) : null,
+  size_bytes: file.size ? String(parseInt(file.size)) : null,  // stringified for jsonb
   drive_modified_time: file.modifiedTime ?? null,
   text_content: textContent ?? null,
   content_status: contentStatus,
-  fetched_at: new Date().toISOString(),
-  updated_at: new Date().toISOString(),
-}, { onConflict: 'connected_account_id,drive_file_id' })
+}
+// pageDocs.push(docRow) — then once per page:
+//   await supabaseAdmin.rpc('collect_account_documents', {
+//     p_account_id: account.id, p_documents: pageDocs,
+//     p_backfill_complete: ..., p_backfill_page_token: ..., p_sync_cursor: ...,
+//   })
 ```
+
+There is **no** direct `supabaseAdmin.from('documents').upsert(...)` anywhere in the collector — that would bypass the advisory lock and reopen the purge race. The RPC is the single write path.
+
+**RPC payload chunking (Codex v4):** a 25-doc page with 500 KB text each is ~12.5 MB of JSON — over typical request limits. Split each page's `pageDocs` into sub-batches of at most `RPC_DOC_BATCH = 5` docs (and/or a ~3 MB serialized ceiling) and call `collect_account_documents` once per sub-batch with `p_backfill_page_token='__unchanged__'`, `p_sync_cursor='__unchanged__'`. Only the **final** sub-batch of the page carries the real cursor/backfill-state advance, so the cursor moves only after every doc on the page is durably written. If an earlier sub-batch fails, the cursor is not advanced and the page is retried next run (upserts are idempotent on `(connected_account_id, drive_file_id)`).
 
 **Error handling:** Per-file try/catch (skip and count errors, same as gmail-collector). Return `{ processed, errors, accounts: accounts?.length }`.
 
