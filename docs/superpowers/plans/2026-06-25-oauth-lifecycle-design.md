@@ -16,6 +16,7 @@
 | 3 | 2026-06-25 | Codex plan review v2 — reconnect state reset, collector race real fix, Vault-before-row delete ordering, migration split for zero-downtime, cache invalidation, error-status disconnect, CORS/validation note, handoff path |
 | 4 | 2026-06-25 | Codex plan review v3 — mismatch revoke on reconnect, atomic collector write guard, disconnect status ordering (revoke-then-mark), gen:types after every migration |
 | 5 | 2026-06-25 | Codex plan review v4 — pg_advisory_xact_lock for collector/disconnect race, gen:types after Migration 1b |
+| 6 | 2026-06-25 | Codex plan review v5 — RPC-based atomic operations (advisory lock only works in single transaction), reconnect callback updates by ID not email upsert |
 
 ---
 
@@ -184,7 +185,37 @@ GRANT EXECUTE ON FUNCTION vault_delete_secret(text) TO service_role;
 7. If `purgeMessages === true`: `DELETE FROM messages WHERE connected_account_id = accountId AND EXISTS (SELECT 1 FROM connected_accounts WHERE id = accountId AND status = 'revoked')` — atomic guard: only purge if status is confirmed revoked
 8. Return `200 { success: true }`
 
-**Collector race (advisory lock):** EU-26-9 wraps the collector's per-account write block and the disconnect/delete status-flip + purge/delete block in a shared PostgreSQL advisory lock keyed by account ID: `SELECT pg_advisory_xact_lock(hashtext(account_id::text))`. This is a transaction-level lock — acquired inside a BEGIN/COMMIT block, released automatically on commit/rollback. The collector holds the lock while writing messages and updating the cursor; disconnect/delete hold it while marking revoked and purging/deleting. If both try to run concurrently, one blocks until the other commits. No schema changes required — advisory locks are built in to PostgreSQL.
+**Collector race (RPC transactions):** PostgREST calls (`.upsert()`, `.update()`) are each a separate transaction — an advisory lock acquired in one call releases before the next call, so it cannot span multiple PostgREST operations. The fix is to move atomic multi-step operations into Postgres RPC functions called via `supabase.rpc()`, which execute in a single transaction.
+
+EU-26-9 adds two RPC functions (Migration 3):
+
+**`collect_account_messages(p_account_id uuid, p_messages jsonb, p_new_cursor text)`**
+```sql
+BEGIN;
+  PERFORM pg_advisory_xact_lock(hashtext(p_account_id::text));
+  -- Re-check status inside the transaction
+  IF NOT EXISTS (SELECT 1 FROM connected_accounts WHERE id = p_account_id AND status = 'active') THEN
+    RETURN; -- account revoked mid-run; skip silently
+  END IF;
+  -- Upsert messages (expand p_messages jsonb to rows)
+  -- Update sync_cursor
+COMMIT;
+```
+
+**`lifecycle_disconnect(p_account_id uuid, p_user_id uuid, p_purge boolean)`**
+```sql
+BEGIN;
+  PERFORM pg_advisory_xact_lock(hashtext(p_account_id::text));
+  -- Verify ownership
+  UPDATE connected_accounts SET status = 'revoked', sync_cursor = NULL
+    WHERE id = p_account_id AND user_id = p_user_id;
+  IF p_purge THEN
+    DELETE FROM messages WHERE connected_account_id = p_account_id;
+  END IF;
+COMMIT;
+```
+
+Similarly, `google-account-delete` calls a `lifecycle_delete(p_account_id, p_user_id)` RPC that does the lock + DELETE in one transaction. The edge functions call Google revoke and Vault operations (which are external — cannot be inside a Postgres transaction) before calling the RPC for the local DB work.
 
 ### New function: `google-account-delete`
 
@@ -221,7 +252,10 @@ GRANT EXECUTE ON FUNCTION vault_delete_secret(text) TO service_role;
 
 **Callback update (EU-26-8):** `google-oauth-callback` currently upserts with `onConflict: 'user_id,email_address'` (line 156). After Migration 1 removes that constraint, this will fail. Must update to `onConflict: 'user_id,provider,email_address'` and deploy alongside the migration.
 
-**Reconnect validation in callback:** When `reconnect_account_id` is present in the state JWT, verify the Google-returned email matches the `email_address` on the `connected_accounts` row. If mismatch: POST-revoke the newly issued refresh token (same body format as disconnect — treat 4xx as success, log 5xx but proceed), then return `400`. This prevents a live untracked Google grant from being issued to account B while reconnecting account A.
+**Reconnect validation in callback:** When `reconnect_account_id` is present in the state JWT:
+1. Verify the Google-returned email matches `email_address` on the row — mismatch: revoke new token, return `400`
+2. Update the row **by `reconnect_account_id` directly** (not an email-based upsert) — if 0 rows updated (row was deleted by a concurrent delete), revoke the new token and return `400`. This prevents a live untracked Google grant persisting after a delete race.
+3. Reset `backfill_complete = false`, `backfill_page_token = NULL`, `backfill_start_history_id = NULL`, `sync_cursor = NULL` on the updated row
 
 **Reconnect state reset in callback:** After a successful reconnect upsert, reset `backfill_complete = false`, `backfill_page_token = NULL`, `backfill_start_history_id = NULL`, and `sync_cursor = NULL` on the account row. This forces the collector to re-run a full backfill from the new grant, preventing the collector from calling `history?startHistoryId=null` (which would error) when `backfill_complete` is still true but `sync_cursor` is null from a prior disconnect.
 
@@ -348,10 +382,12 @@ Migration 1 is split into 1a and 1b to eliminate the deployment window where the
 2. **Migration 2** — `vault_delete_secret` helper → confirm Remote column → `npm run gen:types` (invariant: run after every migration)
 3. **EU-26-8** — Deploy `google-oauth-callback` with updated conflict target (`user_id,provider,email_address`) and reconnect email-match validation
 4. **Migration 1b** — DROP `connected_accounts_user_email_unique` (now safe — callback already uses new target) → confirm Remote column → `npm run gen:types`
-5. Deploy `google-account-disconnect` edge function
-6. Deploy `google-account-delete` edge function
-7. Deploy modified `google-oauth-initiate` (reconnect support)
-8. Frontend changes (AccountCard, DisconnectModal, DeleteAccountModal, hooks, service)
+5. **Migration 3** — RPC functions (`collect_account_messages`, `lifecycle_disconnect`, `lifecycle_delete`) → confirm Remote column → `npm run gen:types`
+6. Deploy `google-account-disconnect` edge function
+7. Deploy `google-account-delete` edge function
+8. Deploy modified `google-oauth-initiate` (reconnect support)
+9. Deploy modified `gmail-collector` (uses `collect_account_messages` RPC)
+10. Frontend changes (AccountCard, DisconnectModal, DeleteAccountModal, hooks, service)
 
 **Why this order is safe:** Step 1a means both constraints exist simultaneously. The old callback still works (old constraint present). Step 3 deploys the updated callback which uses the new constraint. Step 4 removes the old constraint — by this point no code references it. Zero downtime, no window where connections can fail.
 
@@ -391,7 +427,7 @@ Both `google-account-disconnect` and `google-account-delete` must follow the pat
 | #33 | Frontend: modals + AccountCard buttons + cache invalidation |
 | #34 | Edge fn: google-oauth-callback conflict target + reconnect validation + state reset |
 | #35 | Migration 1b: drop old unique key |
-| #36 | Collector: status re-check guard mid-run |
+| #36 | Migration 3 + collector: RPC atomic operations (collect_account_messages, lifecycle_disconnect, lifecycle_delete) |
 
 ---
 
