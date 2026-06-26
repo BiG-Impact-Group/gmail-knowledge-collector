@@ -78,6 +78,9 @@ export default function AccountsPage() {
             <button className={styles.connectBtn} onClick={() => navigate('/documents')}>
               View Documents →
             </button>
+            <button className={styles.connectBtn} onClick={() => navigate('/ask')}>
+              Ask →
+            </button>
           </div>
         )}
       </main>
