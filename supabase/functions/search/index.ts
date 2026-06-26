@@ -44,7 +44,7 @@ function json(body: unknown, status: number, extraHeaders: Record<string, string
 
 Deno.serve(async (req: Request) => {
   if (req.method === 'OPTIONS') {
-    return new Response(null, { headers: corsHeaders })
+    return new Response(null, { headers: { ...corsHeaders, 'Cache-Control': 'no-store' } })
   }
 
   if (req.method !== 'POST') {
