@@ -38,7 +38,8 @@ const corsHeaders = {
 }
 
 function json(body: unknown, status: number, extraHeaders: Record<string, string> = {}): Response {
-  return Response.json(body, { status, headers: { ...corsHeaders, ...extraHeaders } })
+  // Cache-Control: no-store on EVERY response (incl. errors) — search responses are user PII (review v1).
+  return Response.json(body, { status, headers: { ...corsHeaders, 'Cache-Control': 'no-store', ...extraHeaders } })
 }
 
 Deno.serve(async (req: Request) => {
@@ -48,6 +49,23 @@ Deno.serve(async (req: Request) => {
 
   if (req.method !== 'POST') {
     return json({ error: 'method_not_allowed' }, 405)
+  }
+
+  // AUTH GATE FIRST (review v1): verify the caller before doing any body read/parse work, so
+  // unauthenticated traffic is 401'd up front even if platform JWT verification were ever disabled.
+  const supabaseUrl = Deno.env.get('SUPABASE_URL')!
+  const supabaseAnonKey = Deno.env.get('SUPABASE_ANON_KEY')!
+  const authHeader = req.headers.get('Authorization')
+  if (!authHeader) {
+    return json({ error: 'unauthorized' }, 401)
+  }
+  // Anon-key client carrying the caller's JWT — match_chunks runs under the caller's RLS.
+  const supabase = createClient(supabaseUrl, supabaseAnonKey, {
+    global: { headers: { Authorization: authHeader } },
+  })
+  const { data: { user }, error: userError } = await supabase.auth.getUser()
+  if (userError || !user) {
+    return json({ error: 'unauthorized' }, 401)
   }
 
   const contentType = req.headers.get('content-type') ?? ''
@@ -91,24 +109,6 @@ Deno.serve(async (req: Request) => {
       return json({ error: 'invalid_limit' }, 400)
     }
     limit = Math.min(MAX_LIMIT, Math.max(MIN_LIMIT, n))
-  }
-
-  const supabaseUrl = Deno.env.get('SUPABASE_URL')!
-  const supabaseAnonKey = Deno.env.get('SUPABASE_ANON_KEY')!
-
-  const authHeader = req.headers.get('Authorization')
-  if (!authHeader) {
-    return json({ error: 'unauthorized' }, 401)
-  }
-
-  // Anon-key client carrying the caller's JWT — match_chunks runs under the caller's RLS.
-  const supabase = createClient(supabaseUrl, supabaseAnonKey, {
-    global: { headers: { Authorization: authHeader } },
-  })
-
-  const { data: { user }, error: userError } = await supabase.auth.getUser()
-  if (userError || !user) {
-    return json({ error: 'unauthorized' }, 401)
   }
 
   const startedAt = Date.now()
