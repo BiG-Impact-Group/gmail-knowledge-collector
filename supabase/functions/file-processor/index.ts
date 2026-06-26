@@ -326,6 +326,7 @@ Deno.serve(async (req: Request) => {
   let needs_ocr = 0
   let skipped = 0
   let retried = 0
+  let complete_errors = 0
 
   // 1. Producer: enqueue pending jobs for needs_processing documents.
   const { error: enqErr } = await supabaseAdmin.rpc('enqueue_processing_jobs')
@@ -349,7 +350,7 @@ Deno.serve(async (req: Request) => {
   }
 
   async function complete(job: ClaimedJob, r: ConversionResult): Promise<void> {
-    await supabaseAdmin.rpc('complete_processing_job', {
+    const { error } = await supabaseAdmin.rpc('complete_processing_job', {
       p_job_id: job.job_id,
       p_claimed_at: job.claimed_at,
       p_attempts: job.attempts,
@@ -360,6 +361,12 @@ Deno.serve(async (req: Request) => {
       p_error: r.error,
       p_max_attempts: MAX_ATTEMPTS,
     })
+    if (error) {
+      // RPC failed (deadlock abort / transient DB error). Do NOT count as completed — the job
+      // stays 'processing' and is reclaimed after STALE_SECONDS (code review v2).
+      complete_errors++
+      return
+    }
     if (r.outcome === 'extracted') extracted++
     else if (r.outcome === 'needs_ocr') needs_ocr++
     else if (r.outcome === 'skipped') skipped++
@@ -430,5 +437,5 @@ Deno.serve(async (req: Request) => {
     }
   }
 
-  return Response.json({ enqueued, claimed, extracted, needs_ocr, skipped, retried })
+  return Response.json({ enqueued, claimed, extracted, needs_ocr, skipped, retried, complete_errors })
 })
