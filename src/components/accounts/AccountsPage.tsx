@@ -2,6 +2,7 @@ import React from 'react'
 import { useNavigate } from 'react-router-dom'
 import { useAccounts } from '@/hooks/useAccounts'
 import { initiateOAuth } from '@/services/accounts.service'
+import { initiateGoogleDriveOAuth } from '@/services/documents.service'
 import AccountCard from './AccountCard'
 import EmptyState from '@/components/shared/EmptyState'
 import styles from './AccountsPage.module.scss'
@@ -21,6 +22,15 @@ export default function AccountsPage() {
     }
   }
 
+  const handleConnectDrive = async () => {
+    setConnectError(null)
+    try {
+      await initiateGoogleDriveOAuth()
+    } catch (err) {
+      setConnectError(err instanceof Error ? err.message : String(err))
+    }
+  }
+
   const handleSignOut = async () => {
     await supabase.auth.signOut()
     navigate('/login')
@@ -33,6 +43,9 @@ export default function AccountsPage() {
         <div className={styles.headerActions}>
           <button className={styles.connectBtn} onClick={handleConnect}>
             Connect Gmail
+          </button>
+          <button className={styles.connectBtn} onClick={handleConnectDrive}>
+            Connect Google Drive
           </button>
           <button className={styles.signOutBtn} onClick={handleSignOut}>
             Sign out
@@ -61,6 +74,9 @@ export default function AccountsPage() {
           <div className={styles.viewEmails}>
             <button className={styles.connectBtn} onClick={() => navigate('/emails')}>
               View Emails →
+            </button>
+            <button className={styles.connectBtn} onClick={() => navigate('/documents')}>
+              View Documents →
             </button>
           </div>
         )}

@@ -2,6 +2,7 @@ import { useState } from 'react'
 import styles from './AccountCard.module.scss'
 import type { ConnectedAccount } from '@/services/accounts.service'
 import { reconnectAccount } from '@/services/accounts.service'
+import { initiateGoogleDriveOAuth } from '@/services/documents.service'
 import { useDisconnectAccount, useDeleteAccount } from '@/hooks/useAccounts'
 import DisconnectModal from './DisconnectModal'
 import DeleteAccountModal from './DeleteAccountModal'
@@ -36,11 +37,20 @@ export default function AccountCard({ account }: Props) {
   const canReconnect = account.status === 'error' || account.status === 'revoked'
   const canDisconnect = account.status === 'active' || account.status === 'error'
 
+  const isDrive = account.provider === 'google_drive'
+  const providerLabel = isDrive ? 'Google Drive' : 'Google'
+  const providerIcon = isDrive ? '📁' : '✉️'
+
   async function handleReconnect() {
     setIsReconnecting(true)
     setReconnectError(null)
     try {
-      await reconnectAccount(account.id)
+      // Reconnect must use the same provider as the original connection.
+      if (isDrive) {
+        await initiateGoogleDriveOAuth({ reconnect: true, accountId: account.id })
+      } else {
+        await reconnectAccount(account.id)
+      }
     } catch (e) {
       setReconnectError((e as Error).message ?? 'Reconnect failed. Please try again.')
     } finally {
@@ -67,8 +77,11 @@ export default function AccountCard({ account }: Props) {
       <div className={styles.card}>
         <div className={styles.header}>
           <div className={styles.info}>
-            <span className={styles.email}>{account.email_address}</span>
-            <span className={styles.provider}>Google</span>
+            <span className={styles.email}>
+              <span className={styles.providerIcon} aria-hidden="true">{providerIcon}</span>
+              {account.email_address}
+            </span>
+            <span className={styles.provider}>{providerLabel}</span>
           </div>
           <span className={`${styles.status} ${styles[account.status as keyof typeof styles]}`}>
             {account.status}

@@ -39,7 +39,9 @@
 
 .viewEmails {
   margin-top: $spacing-lg;
-  text-align: center;
+  display: flex;
+  justify-content: center;
+  gap: $spacing-sm;
 }
 
 .loading,

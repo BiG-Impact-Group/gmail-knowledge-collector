@@ -1,0 +1,73 @@
+@use '@/styles/tokens' as *;
+
+.empty {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  height: 100%;
+  color: $color-text-secondary;
+  font-size: $font-size-md;
+}
+
+.detail {
+  display: flex;
+  flex-direction: column;
+  height: 100%;
+  overflow: hidden;
+}
+
+.header {
+  padding: $spacing-md $spacing-lg;
+  border-bottom: 1px solid $color-border;
+  flex-shrink: 0;
+}
+
+.name {
+  font-size: $font-size-lg;
+  font-weight: 600;
+  margin: 0 0 $spacing-sm;
+  color: $color-text-primary;
+  overflow-wrap: anywhere;
+}
+
+.meta {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  font-size: $font-size-sm;
+  color: $color-text-secondary;
+}
+
+.driveLink {
+  color: $color-primary;
+  text-decoration: none;
+
+  &:hover {
+    text-decoration: underline;
+  }
+}
+
+.body {
+  flex: 1;
+  overflow: hidden;
+  display: flex;
+  flex-direction: column;
+}
+
+.text {
+  flex: 1;
+  padding: $spacing-md $spacing-lg;
+  margin: 0;
+  font-family: inherit;
+  font-size: $font-size-base;
+  white-space: pre-wrap;
+  overflow-y: auto;
+  color: $color-text-primary;
+}
+
+.statusMessage,
+.noContent {
+  padding: $spacing-lg;
+  color: $color-text-secondary;
+  font-style: italic;
+}

@@ -1,0 +1,8 @@
+@use '@/styles/tokens' as *;
+
+.list {
+  flex: 1;
+  min-height: 0;
+  overflow-y: auto;
+  border-right: 1px solid $color-border;
+}

@@ -13,6 +13,16 @@ const REDIRECT_URI = 'https://ybgtzyutbvwfhgtlmnah.supabase.co/functions/v1/goog
 const TOKEN_URL = 'https://oauth2.googleapis.com/token'
 const GOOGLE_REVOKE_URL = 'https://oauth2.googleapis.com/revoke'
 
+// Provider-driven scope mapping. The callback records granted_scopes per provider so a
+// Drive connection records drive.readonly rather than the hardcoded Gmail scope string.
+const PROVIDER_SCOPES: Record<string, string> = {
+  google:       'openid email https://www.googleapis.com/auth/gmail.readonly',
+  google_drive: 'openid email https://www.googleapis.com/auth/drive.readonly',
+}
+
+// Open-redirect guard: only redirect to known app paths even though state is HMAC-signed.
+const ALLOWED_REDIRECTS = new Set(['/accounts', '/documents'])
+
 function base64urlDecode(str: string): string {
   const base64 = str.replace(/-/g, '+').replace(/_/g, '/')
   const padded = base64 + '='.repeat((4 - (base64.length % 4)) % 4)
@@ -25,7 +35,9 @@ interface StatePayload {
   nonce: string
   exp: number
   reconnect_account_id?: string
-  provider?: string
+  provider?: string        // 'google' | 'google_drive' — defaults to 'google'
+  redirect_path?: string   // e.g. '/documents' — defaults to '/accounts'
+  expected_lifecycle_version?: number  // signed at reconnect-initiate; guards the reconnect update
 }
 
 async function verifyStateJwt(token: string, secret: string): Promise<StatePayload> {
@@ -111,6 +123,18 @@ Deno.serve(async (req: Request) => {
     return new Response('Invalid or expired state. Please try again.', { status: 400 })
   }
 
+  // Validate the provider before writing any unconstrained row.
+  const provider = statePayload.provider ?? 'google'
+  if (!(provider in PROVIDER_SCOPES)) {
+    console.error('Unknown provider in state JWT')
+    return new Response('Invalid provider. Please try again.', { status: 400 })
+  }
+  const grantedScopes = PROVIDER_SCOPES[provider]
+
+  // Whitelist the post-success redirect path (open-redirect guard).
+  const requestedRedirect = statePayload.redirect_path ?? '/accounts'
+  const redirectPath = ALLOWED_REDIRECTS.has(requestedRedirect) ? requestedRedirect : '/accounts'
+
   const supabaseAdmin = createClient(supabaseUrl, serviceRoleKey)
 
   // Consume nonce atomically — a second request with the same state is rejected
@@ -157,6 +181,9 @@ Deno.serve(async (req: Request) => {
 
   if (!tokens.refresh_token) {
     console.error('No refresh_token in response. Tokens keys:', Object.keys(tokens))
+    // No refresh token to store, but the access token is a live grant — revoke it so we
+    // never abort after token exchange while leaving a usable credential active.
+    if (tokens.access_token) await tryRevokeToken(tokens.access_token)
     return new Response('No refresh token returned. Revoke access at myaccount.google.com/permissions and try again.', { status: 400 })
   }
 
@@ -179,7 +206,7 @@ Deno.serve(async (req: Request) => {
       // Fetch the existing account to verify email match and get current state
       const { data: existingAccount, error: fetchErr } = await supabaseAdmin
         .from('connected_accounts')
-        .select('id, email_address, lifecycle_version')
+        .select('id, email_address, lifecycle_version, provider')
         .eq('id', reconnectAccountId)
         .eq('user_id', userId)
         .single()
@@ -189,30 +216,39 @@ Deno.serve(async (req: Request) => {
         throw new Error('account_not_found')
       }
 
+      // Provider must match: a Gmail reconnect must not overwrite a Drive account's
+      // tokens/scopes or vice-versa.
+      if (existingAccount.provider !== provider) {
+        console.error('Reconnect: provider mismatch between state JWT and existing account')
+        throw new Error('provider_mismatch')
+      }
+
       // Email must match the account being reconnected
       if (existingAccount.email_address !== emailAddress) {
         console.error('Reconnect: email mismatch — expected account email, got different address')
         throw new Error('email_mismatch')
       }
 
-      // Update the row by ID, guarded on lifecycle_version to detect concurrent disconnect/delete.
-      // If lifecycle_disconnect/lifecycle_delete ran between initiate and callback, they increment
-      // lifecycle_version; this .eq() guard produces 0 rows → throws concurrent_delete below.
+      // Guard against the lifecycle_version captured at INITIATE time (signed into state),
+      // falling back to the current row version for older states without the field. This
+      // detects a disconnect/delete that ran ANY time between initiation and this callback,
+      // not just one racing this transaction. A mismatch → 0 rows → concurrent_delete (token revoked).
+      const guardVersion = statePayload.expected_lifecycle_version ?? existingAccount.lifecycle_version
       const { data: updatedRows, error: updateErr } = await supabaseAdmin
         .from('connected_accounts')
         .update({
           status: 'error', // will be set active after vault write
-          granted_scopes: 'openid email https://www.googleapis.com/auth/gmail.readonly',
+          granted_scopes: grantedScopes,
           backfill_complete: false,
           backfill_page_token: null,
           backfill_start_history_id: null,
           sync_cursor: null,
-          lifecycle_version: existingAccount.lifecycle_version + 1,
+          lifecycle_version: guardVersion + 1,
           updated_at: new Date().toISOString(),
         })
         .eq('id', reconnectAccountId)
         .eq('user_id', userId)
-        .eq('lifecycle_version', existingAccount.lifecycle_version)
+        .eq('lifecycle_version', guardVersion)
         .select('id')
 
       if (updateErr) {
@@ -258,11 +294,14 @@ Deno.serve(async (req: Request) => {
         }
       }
 
-      // Vault write succeeded — mark account active
+      // Vault write succeeded — mark account active, GUARDED on the version we set above.
+      // If a disconnect/delete landed after our guarded update (bumping the version again),
+      // this matches 0 rows → abort + revoke, so we never resurrect a just-revoked account.
       const { data: activatedRows, error: activateErr } = await supabaseAdmin
         .from('connected_accounts')
         .update({ status: 'active', updated_at: new Date().toISOString() })
         .eq('id', account.id)
+        .eq('lifecycle_version', guardVersion + 1)
         .select('id')
       if (activateErr || !activatedRows?.length) {
         console.error('Mark active failed (reconnect):', JSON.stringify(activateErr))
@@ -276,7 +315,7 @@ Deno.serve(async (req: Request) => {
         .from('connected_accounts')
         .select('id, status, lifecycle_version')
         .eq('user_id', userId)
-        .eq('provider', 'google')
+        .eq('provider', provider)
         .eq('email_address', emailAddress)
         .maybeSingle()
 
@@ -287,10 +326,10 @@ Deno.serve(async (req: Request) => {
         .from('connected_accounts')
         .upsert({
           user_id: userId,
-          provider: 'google',
+          provider,
           email_address: emailAddress,
           status: 'error',
-          granted_scopes: 'openid email https://www.googleapis.com/auth/gmail.readonly',
+          granted_scopes: grantedScopes,
           updated_at: new Date().toISOString(),
           // Reset backfill state when reactivating an error/revoked account so the
           // collector doesn't call history?startHistoryId=null after seeing backfill_complete=true
@@ -305,13 +344,14 @@ Deno.serve(async (req: Request) => {
           onConflict: 'user_id,provider,email_address',
           ignoreDuplicates: false,
         })
-        .select('id')
+        .select('id, lifecycle_version')
         .single()
 
       if (upsertError || !account) {
         console.error('Upsert error:', JSON.stringify(upsertError))
         throw new Error('upsert_failed')
       }
+      const upsertVersion = account.lifecycle_version
 
       // Store refresh token in Vault keyed by account id
       const { data: existingSecretId, error: vaultLookupError } = await supabaseAdmin
@@ -343,11 +383,13 @@ Deno.serve(async (req: Request) => {
         }
       }
 
-      // Vault write succeeded — mark account active
+      // Vault write succeeded — mark account active, GUARDED on the version from the upsert.
+      // A disconnect/delete landing in this window bumps lifecycle_version → 0 rows → abort + revoke.
       const { data: activatedRows, error: activateErr } = await supabaseAdmin
         .from('connected_accounts')
         .update({ status: 'active', updated_at: new Date().toISOString() })
         .eq('id', account.id)
+        .eq('lifecycle_version', upsertVersion)
         .select('id')
       if (activateErr || !activatedRows?.length) {
         console.error('Mark active failed (new connection):', JSON.stringify(activateErr))
@@ -379,6 +421,9 @@ Deno.serve(async (req: Request) => {
     if (msg === 'email_mismatch') {
       return new Response('Email mismatch: reconnect must use the same Google account.', { status: 400 })
     }
+    if (msg === 'provider_mismatch') {
+      return new Response('Provider mismatch: reconnect must use the same provider as the original connection.', { status: 400 })
+    }
     if (msg === 'concurrent_delete') {
       return new Response('Account was deleted concurrently. Please reconnect from scratch.', { status: 400 })
     }
@@ -386,5 +431,5 @@ Deno.serve(async (req: Request) => {
   }
 
   // access_token is ephemeral — never stored
-  return Response.redirect(`${siteUrl}/accounts`, 302)
+  return Response.redirect(`${siteUrl}${redirectPath}`, 302)
 })

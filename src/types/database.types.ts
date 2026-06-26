@@ -65,6 +65,65 @@ export type Database = {
         }
         Relationships: []
       }
+      documents: {
+        Row: {
+          connected_account_id: string
+          content_status: string
+          created_at: string
+          drive_file_id: string
+          drive_modified_time: string | null
+          fetched_at: string
+          id: string
+          mime_type: string
+          name: string
+          size_bytes: number | null
+          text_content: string | null
+          updated_at: string
+          user_id: string
+          web_view_link: string | null
+        }
+        Insert: {
+          connected_account_id: string
+          content_status?: string
+          created_at?: string
+          drive_file_id: string
+          drive_modified_time?: string | null
+          fetched_at?: string
+          id?: string
+          mime_type: string
+          name: string
+          size_bytes?: number | null
+          text_content?: string | null
+          updated_at?: string
+          user_id: string
+          web_view_link?: string | null
+        }
+        Update: {
+          connected_account_id?: string
+          content_status?: string
+          created_at?: string
+          drive_file_id?: string
+          drive_modified_time?: string | null
+          fetched_at?: string
+          id?: string
+          mime_type?: string
+          name?: string
+          size_bytes?: number | null
+          text_content?: string | null
+          updated_at?: string
+          user_id?: string
+          web_view_link?: string | null
+        }
+        Relationships: [
+          {
+            foreignKeyName: "documents_user_account_fk"
+            columns: ["user_id", "connected_account_id"]
+            isOneToOne: false
+            referencedRelation: "connected_accounts"
+            referencedColumns: ["user_id", "id"]
+          },
+        ]
+      }
       messages: {
         Row: {
           body_html: string | null
@@ -154,8 +213,27 @@ export type Database = {
       [_ in never]: never
     }
     Functions: {
+      collect_account_documents: {
+        Args: {
+          p_account_id: string
+          p_backfill_complete: boolean
+          p_backfill_page_token: string
+          p_documents: Json
+          p_expected_version: number
+          p_sync_cursor: string
+        }
+        Returns: undefined
+      }
       collect_account_messages: {
         Args: { p_account_id: string; p_messages: Json; p_new_cursor: string }
+        Returns: undefined
+      }
+      delete_account_documents: {
+        Args: {
+          p_account_id: string
+          p_expected_version: number
+          p_file_ids: string[]
+        }
         Returns: undefined
       }
       get_vault_secret: { Args: { secret_name: string }; Returns: string }
@@ -176,6 +254,10 @@ export type Database = {
           p_user_id: string
         }
         Returns: boolean
+      }
+      reset_account_documents: {
+        Args: { p_account_id: string; p_expected_version: number }
+        Returns: undefined
       }
       vault_create_secret: {
         Args: { description?: string; name: string; secret: string }

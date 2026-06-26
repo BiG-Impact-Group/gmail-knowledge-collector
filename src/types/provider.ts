@@ -1,1 +1,1 @@
-export type Provider = 'google' | 'microsoft' | 'slack'
+export type Provider = 'google' | 'google_drive' | 'microsoft' | 'slack'
