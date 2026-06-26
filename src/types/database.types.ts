@@ -208,8 +208,6 @@ export type Database = {
         }
         Relationships: []
       }
-      // EU-05-9 (HAND-AUGMENTED, regenerate from remote after Migration 3 applied):
-      // processing_jobs table types. Replace with `npm run gen:types` output post-deploy.
       processing_jobs: {
         Row: {
           attempts: number
@@ -262,6 +260,25 @@ export type Database = {
       [_ in never]: never
     }
     Functions: {
+      claim_processing_jobs: {
+        Args: {
+          p_limit: number
+          p_max_attempts: number
+          p_stale_seconds: number
+        }
+        Returns: {
+          attempts: number
+          claimed_at: string
+          connected_account_id: string
+          document_id: string
+          drive_file_id: string
+          drive_modified_time: string
+          job_id: string
+          lifecycle_version: number
+          mime_type: string
+          user_id: string
+        }[]
+      }
       collect_account_documents: {
         Args: {
           p_account_id: string
@@ -277,43 +294,18 @@ export type Database = {
         Args: { p_account_id: string; p_messages: Json; p_new_cursor: string }
         Returns: undefined
       }
-      // EU-05-9 (HAND-AUGMENTED, regenerate from remote after Migration 4 applied):
-      // processing_jobs RPC signatures. Replace with `npm run gen:types` output post-deploy.
-      claim_processing_jobs: {
-        Args: {
-          p_limit: number
-          p_max_attempts: number
-          p_stale_seconds: number
-        }
-        Returns: {
-          job_id: string
-          document_id: string
-          user_id: string
-          attempts: number
-          claimed_at: string
-          drive_file_id: string
-          mime_type: string
-          connected_account_id: string
-          lifecycle_version: number
-          drive_modified_time: string | null
-        }[]
-      }
       complete_processing_job: {
         Args: {
-          p_job_id: string
-          p_claimed_at: string
           p_attempts: number
+          p_claimed_at: string
+          p_drive_modified_time: string
+          p_error: string
+          p_job_id: string
           p_lifecycle_version: number
-          p_drive_modified_time: string | null
-          p_outcome: string
-          p_text: string | null
-          p_error: string | null
           p_max_attempts: number
+          p_outcome: string
+          p_text: string
         }
-        Returns: undefined
-      }
-      enqueue_processing_jobs: {
-        Args: Record<PropertyKey, never>
         Returns: undefined
       }
       delete_account_documents: {
@@ -324,6 +316,7 @@ export type Database = {
         }
         Returns: undefined
       }
+      enqueue_processing_jobs: { Args: never; Returns: undefined }
       get_vault_secret: { Args: { secret_name: string }; Returns: string }
       get_vault_secret_id: { Args: { secret_name: string }; Returns: string }
       lifecycle_delete: {
