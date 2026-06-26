@@ -18,6 +18,7 @@
 | 5 | 2026-06-25 | Codex plan review v4 — pg_advisory_xact_lock for collector/disconnect race, gen:types after Migration 1b |
 | 6 | 2026-06-25 | Codex plan review v5 — RPC-based atomic operations (advisory lock only works in single transaction), reconnect callback updates by ID not email upsert |
 | 7 | 2026-06-25 | Codex plan review v6 — REVOKE/GRANT on RPCs, deploy collector before lifecycle fns, fix BEGIN/COMMIT → BEGIN...END in PL/pgSQL |
+| 8 | 2026-06-25 | Codex plan review v7 — token revoke on all callback abort paths, lifecycle_version column for disconnect/reconnect race |
 
 ---
 
@@ -122,6 +123,19 @@ BEGIN
 END $$;
 ```
 
+### Migration 0 — lifecycle_version column
+
+**File:** `supabase/migrations/<timestamp>_lifecycle_version.sql`
+
+Add an integer version column to `connected_accounts`, incremented by reconnect and checked by lifecycle functions to detect races:
+
+```sql
+ALTER TABLE public.connected_accounts
+  ADD COLUMN IF NOT EXISTS lifecycle_version integer NOT NULL DEFAULT 0;
+```
+
+This column is used by `lifecycle_disconnect` and `lifecycle_delete` RPCs (Migration 3) to verify no reconnect occurred between when the edge function read the account and when it calls the RPC. The RPC checks `lifecycle_version = p_expected_version`; if mismatch, it returns without acting. Reconnect callback increments `lifecycle_version` atomically as part of its update.
+
 ### No status enum change
 
 `error` status continues to represent needs-reauth. No new `needs_reauth` value, no CHECK migration. The UI labels the state clearly; the status string is internal.
@@ -214,32 +228,50 @@ END;
 $$;
 ```
 
-**`lifecycle_disconnect(p_account_id uuid, p_user_id uuid, p_purge boolean) RETURNS void`**
+**`lifecycle_disconnect(p_account_id uuid, p_user_id uuid, p_purge boolean, p_expected_version integer) RETURNS boolean`**
+
+Returns `true` if the operation completed, `false` if aborted due to version mismatch (reconnect occurred concurrently — edge function must then revoke the token it already deleted from Vault).
+
 ```sql
 CREATE OR REPLACE FUNCTION lifecycle_disconnect(...)
-RETURNS void LANGUAGE plpgsql SECURITY DEFINER AS $$
+RETURNS boolean LANGUAGE plpgsql SECURITY DEFINER AS $$
+DECLARE v_version integer;
 BEGIN
   PERFORM pg_advisory_xact_lock(hashtext(p_account_id::text));
+  SELECT lifecycle_version INTO v_version
+    FROM connected_accounts WHERE id = p_account_id AND user_id = p_user_id;
+  IF v_version IS DISTINCT FROM p_expected_version THEN
+    RETURN false; -- reconnect raced; edge function must revoke
+  END IF;
   UPDATE connected_accounts SET status = 'revoked', sync_cursor = NULL
     WHERE id = p_account_id AND user_id = p_user_id;
   IF p_purge THEN
     DELETE FROM messages WHERE connected_account_id = p_account_id;
   END IF;
+  RETURN true;
 END;
 $$;
 ```
 
-**`lifecycle_delete(p_account_id uuid, p_user_id uuid) RETURNS void`**
+**`lifecycle_delete(p_account_id uuid, p_user_id uuid, p_expected_version integer) RETURNS boolean`**
 ```sql
 CREATE OR REPLACE FUNCTION lifecycle_delete(...)
-RETURNS void LANGUAGE plpgsql SECURITY DEFINER AS $$
+RETURNS boolean LANGUAGE plpgsql SECURITY DEFINER AS $$
+DECLARE v_version integer;
 BEGIN
   PERFORM pg_advisory_xact_lock(hashtext(p_account_id::text));
+  SELECT lifecycle_version INTO v_version
+    FROM connected_accounts WHERE id = p_account_id AND user_id = p_user_id;
+  IF v_version IS DISTINCT FROM p_expected_version THEN
+    RETURN false;
+  END IF;
   DELETE FROM connected_accounts WHERE id = p_account_id AND user_id = p_user_id;
-  -- cascades to messages via FK
+  RETURN true;
 END;
 $$;
 ```
+
+**Edge function handling of `false` return:** if `lifecycle_disconnect` or `lifecycle_delete` returns `false`, the edge function already deleted the Vault secret — it must re-read the account's current Vault secret and revoke it at Google before returning `409 Conflict` to the browser. The user can retry once the reconnect completes.
 
 Note: No `BEGIN;`/`COMMIT;` SQL transaction commands inside PL/pgSQL functions — the RPC call itself is the transaction boundary. `BEGIN...END` is PL/pgSQL block syntax only. The edge functions call Google revoke and Vault operations (external — cannot be inside a Postgres transaction) before calling the RPC for local DB work.
 
@@ -283,7 +315,9 @@ Note: No `BEGIN;`/`COMMIT;` SQL transaction commands inside PL/pgSQL functions �
 2. Update the row **by `reconnect_account_id` directly** (not an email-based upsert) — if 0 rows updated (row was deleted by a concurrent delete), revoke the new token and return `400`. This prevents a live untracked Google grant persisting after a delete race.
 3. Reset `backfill_complete = false`, `backfill_page_token = NULL`, `backfill_start_history_id = NULL`, `sync_cursor = NULL` on the updated row
 
-**Reconnect state reset in callback:** After a successful reconnect upsert, reset `backfill_complete = false`, `backfill_page_token = NULL`, `backfill_start_history_id = NULL`, and `sync_cursor = NULL` on the account row. This forces the collector to re-run a full backfill from the new grant, preventing the collector from calling `history?startHistoryId=null` (which would error) when `backfill_complete` is still true but `sync_cursor` is null from a prior disconnect.
+**Reconnect state reset in callback:** After a successful reconnect update, reset `backfill_complete = false`, `backfill_page_token = NULL`, `backfill_start_history_id = NULL`, `sync_cursor = NULL`, and increment `lifecycle_version = lifecycle_version + 1`. The version increment is what causes any concurrent `lifecycle_disconnect`/`lifecycle_delete` to detect a race and abort.
+
+**Token invariant — every abort path after token exchange must attempt revoke:** The callback wraps all post-exchange operations (userinfo fetch, email match, DB update, Vault write) in a try/catch. If any step fails, the catch block attempts to POST-revoke the newly issued refresh token before returning the error. Revoke failure in the catch block is logged but does not change the error response — best effort. This ensures no newly issued token is silently dropped without a revoke attempt. This forces the collector to re-run a full backfill from the new grant, preventing the collector from calling `history?startHistoryId=null` (which would error) when `backfill_complete` is still true but `sync_cursor` is null from a prior disconnect.
 
 ---
 
@@ -404,16 +438,17 @@ No new RLS policies. All writes (UPDATE status, DELETE messages, DELETE connecte
 
 Migration 1 is split into 1a and 1b to eliminate the deployment window where the callback and constraint are out of sync.
 
-1. **Migration 1a** — ADD `UNIQUE (user_id, provider, email_address)` (old constraint still present) → confirm Remote column → `npm run gen:types`
-2. **Migration 2** — `vault_delete_secret` helper → confirm Remote column → `npm run gen:types` (invariant: run after every migration)
-3. **EU-26-8** — Deploy `google-oauth-callback` with updated conflict target (`user_id,provider,email_address`) and reconnect email-match validation
-4. **Migration 1b** — DROP `connected_accounts_user_email_unique` (now safe — callback already uses new target) → confirm Remote column → `npm run gen:types`
-5. **Migration 3** — RPC functions (`collect_account_messages`, `lifecycle_disconnect`, `lifecycle_delete`) → confirm Remote column → `npm run gen:types`
-6. Deploy modified `gmail-collector` (uses `collect_account_messages` RPC) — **must deploy before lifecycle edge functions so the lock is active before disconnect/delete are exposed**
-7. Deploy modified `google-oauth-initiate` (reconnect support)
-8. Deploy `google-account-disconnect` edge function
-9. Deploy `google-account-delete` edge function
-10. Frontend changes (AccountCard, DisconnectModal, DeleteAccountModal, hooks, service)
+1. **Migration 0** — ADD `lifecycle_version` column → confirm Remote column → `npm run gen:types`
+2. **Migration 1a** — ADD `UNIQUE (user_id, provider, email_address)` (old constraint still present) → confirm Remote column → `npm run gen:types`
+3. **Migration 2** — `vault_delete_secret` helper → confirm Remote column → `npm run gen:types`
+4. **Migration 3** — RPC functions (`collect_account_messages`, `lifecycle_disconnect`, `lifecycle_delete`) → confirm Remote column → `npm run gen:types`
+5. **EU-26-8** — Deploy `google-oauth-callback` (updated conflict target, reconnect validation + `lifecycle_version` increment, token-on-abort revoke)
+6. **Migration 1b** — DROP `connected_accounts_user_email_unique` → confirm Remote column → `npm run gen:types`
+7. Deploy modified `gmail-collector` (uses `collect_account_messages` RPC) — **must deploy before lifecycle edge functions**
+8. Deploy modified `google-oauth-initiate` (reconnect support)
+9. Deploy `google-account-disconnect` edge function
+10. Deploy `google-account-delete` edge function
+11. Frontend changes (AccountCard, DisconnectModal, DeleteAccountModal, hooks, service)
 
 **Critical ordering note:** Step 6 must precede steps 8–9. During any window where lifecycle endpoints exist but the collector is still writing unguarded, a purge can be followed by reinserts. Deploy collector first, verify it is running the RPC path, then expose disconnect/delete.
 
@@ -446,6 +481,7 @@ Both `google-account-disconnect` and `google-account-delete` must follow the pat
 | Issue | Title |
 |-------|-------|
 | #26 | Epic 03 parent |
+| #37 | Migration 0: lifecycle_version column |
 | #27 | Migration 1a: add provider-aware unique key |
 | #28 | Migration 2: vault_delete_secret helper |
 | #29 | Edge fn: google-account-disconnect |
