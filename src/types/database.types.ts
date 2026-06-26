@@ -65,6 +65,65 @@ export type Database = {
         }
         Relationships: []
       }
+      documents: {
+        Row: {
+          connected_account_id: string
+          content_status: string
+          created_at: string
+          drive_file_id: string
+          drive_modified_time: string | null
+          fetched_at: string
+          id: string
+          mime_type: string
+          name: string
+          size_bytes: number | null
+          text_content: string | null
+          updated_at: string
+          user_id: string
+          web_view_link: string | null
+        }
+        Insert: {
+          connected_account_id: string
+          content_status?: string
+          created_at?: string
+          drive_file_id: string
+          drive_modified_time?: string | null
+          fetched_at?: string
+          id?: string
+          mime_type: string
+          name: string
+          size_bytes?: number | null
+          text_content?: string | null
+          updated_at?: string
+          user_id: string
+          web_view_link?: string | null
+        }
+        Update: {
+          connected_account_id?: string
+          content_status?: string
+          created_at?: string
+          drive_file_id?: string
+          drive_modified_time?: string | null
+          fetched_at?: string
+          id?: string
+          mime_type?: string
+          name?: string
+          size_bytes?: number | null
+          text_content?: string | null
+          updated_at?: string
+          user_id?: string
+          web_view_link?: string | null
+        }
+        Relationships: [
+          {
+            foreignKeyName: "documents_user_account_fk"
+            columns: ["user_id", "connected_account_id"]
+            isOneToOne: false
+            referencedRelation: "connected_accounts"
+            referencedColumns: ["user_id", "id"]
+          },
+        ]
+      }
       messages: {
         Row: {
           body_html: string | null
@@ -124,65 +183,6 @@ export type Database = {
           },
           {
             foreignKeyName: "messages_user_id_connected_account_fk"
-            columns: ["user_id", "connected_account_id"]
-            isOneToOne: false
-            referencedRelation: "connected_accounts"
-            referencedColumns: ["user_id", "id"]
-          },
-        ]
-      }
-      documents: {
-        Row: {
-          connected_account_id: string
-          content_status: string
-          created_at: string
-          drive_file_id: string
-          drive_modified_time: string | null
-          fetched_at: string
-          id: string
-          mime_type: string
-          name: string
-          size_bytes: number | null
-          text_content: string | null
-          updated_at: string
-          user_id: string
-          web_view_link: string | null
-        }
-        Insert: {
-          connected_account_id: string
-          content_status?: string
-          created_at?: string
-          drive_file_id: string
-          drive_modified_time?: string | null
-          fetched_at?: string
-          id?: string
-          mime_type: string
-          name: string
-          size_bytes?: number | null
-          text_content?: string | null
-          updated_at?: string
-          user_id: string
-          web_view_link?: string | null
-        }
-        Update: {
-          connected_account_id?: string
-          content_status?: string
-          created_at?: string
-          drive_file_id?: string
-          drive_modified_time?: string | null
-          fetched_at?: string
-          id?: string
-          mime_type?: string
-          name?: string
-          size_bytes?: number | null
-          text_content?: string | null
-          updated_at?: string
-          user_id?: string
-          web_view_link?: string | null
-        }
-        Relationships: [
-          {
-            foreignKeyName: "documents_user_account_fk"
             columns: ["user_id", "connected_account_id"]
             isOneToOne: false
             referencedRelation: "connected_accounts"
