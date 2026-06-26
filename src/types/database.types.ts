@@ -14,6 +14,47 @@ export type Database = {
   }
   public: {
     Tables: {
+      chunks: {
+        Row: {
+          chunk_index: number
+          content: string
+          created_at: string
+          document_id: string
+          embedding: string
+          id: string
+          source_version: string
+          user_id: string
+        }
+        Insert: {
+          chunk_index: number
+          content: string
+          created_at?: string
+          document_id: string
+          embedding: string
+          id?: string
+          source_version: string
+          user_id: string
+        }
+        Update: {
+          chunk_index?: number
+          content?: string
+          created_at?: string
+          document_id?: string
+          embedding?: string
+          id?: string
+          source_version?: string
+          user_id?: string
+        }
+        Relationships: [
+          {
+            foreignKeyName: "chunks_user_document_fk"
+            columns: ["user_id", "document_id"]
+            isOneToOne: false
+            referencedRelation: "documents"
+            referencedColumns: ["user_id", "id"]
+          },
+        ]
+      }
       connected_accounts: {
         Row: {
           backfill_complete: boolean
@@ -120,6 +161,59 @@ export type Database = {
             columns: ["user_id", "connected_account_id"]
             isOneToOne: false
             referencedRelation: "connected_accounts"
+            referencedColumns: ["user_id", "id"]
+          },
+        ]
+      }
+      embedding_jobs: {
+        Row: {
+          attempts: number
+          chunk_count: number | null
+          claimed_at: string | null
+          created_at: string
+          document_id: string
+          id: string
+          last_error: string | null
+          source_version: string
+          status: string
+          truncated: boolean
+          updated_at: string
+          user_id: string
+        }
+        Insert: {
+          attempts?: number
+          chunk_count?: number | null
+          claimed_at?: string | null
+          created_at?: string
+          document_id: string
+          id?: string
+          last_error?: string | null
+          source_version: string
+          status?: string
+          truncated?: boolean
+          updated_at?: string
+          user_id: string
+        }
+        Update: {
+          attempts?: number
+          chunk_count?: number | null
+          claimed_at?: string | null
+          created_at?: string
+          document_id?: string
+          id?: string
+          last_error?: string | null
+          source_version?: string
+          status?: string
+          truncated?: boolean
+          updated_at?: string
+          user_id?: string
+        }
+        Relationships: [
+          {
+            foreignKeyName: "embedding_jobs_user_document_fk"
+            columns: ["user_id", "document_id"]
+            isOneToOne: false
+            referencedRelation: "documents"
             referencedColumns: ["user_id", "id"]
           },
         ]
@@ -260,6 +354,23 @@ export type Database = {
       [_ in never]: never
     }
     Functions: {
+      claim_embedding_jobs: {
+        Args: {
+          p_limit: number
+          p_max_attempts: number
+          p_stale_seconds: number
+        }
+        Returns: {
+          attempts: number
+          claimed_at: string
+          connected_account_id: string
+          document_id: string
+          drive_modified_time: string
+          job_id: string
+          lifecycle_version: number
+          user_id: string
+        }[]
+      }
       claim_processing_jobs: {
         Args: {
           p_limit: number
@@ -294,6 +405,21 @@ export type Database = {
         Args: { p_account_id: string; p_messages: Json; p_new_cursor: string }
         Returns: undefined
       }
+      complete_embedding_job: {
+        Args: {
+          p_attempts: number
+          p_chunks: Json
+          p_claimed_at: string
+          p_drive_modified_time: string
+          p_error: string
+          p_job_id: string
+          p_lifecycle_version: number
+          p_max_attempts: number
+          p_outcome: string
+          p_truncated: boolean
+        }
+        Returns: undefined
+      }
       complete_processing_job: {
         Args: {
           p_attempts: number
@@ -316,6 +442,7 @@ export type Database = {
         }
         Returns: undefined
       }
+      enqueue_embedding_jobs: { Args: never; Returns: undefined }
       enqueue_processing_jobs: { Args: never; Returns: undefined }
       get_vault_secret: { Args: { secret_name: string }; Returns: string }
       get_vault_secret_id: { Args: { secret_name: string }; Returns: string }

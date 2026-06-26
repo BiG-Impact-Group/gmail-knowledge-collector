@@ -1,5 +1,3 @@
 role: planner
+slug: epic-06-vector-store
 from_branch: test
-planning_branch: plan/epic-05-file-processing-pipeline
-future_build_branch: feature/epic-05-file-processing-pipeline
-slug: epic-05-file-processing-pipeline
