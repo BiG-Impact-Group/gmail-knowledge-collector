@@ -98,9 +98,10 @@ interface ClaimedJob {
 interface ChunkPayload { chunk_index: number; content: string; embedding: number[] }
 
 Deno.serve(async (req: Request) => {
-  const cronSecret = Deno.env.get('CRON_SECRET')!
+  const cronSecret = Deno.env.get('CRON_SECRET')
   const authHeader = req.headers.get('Authorization')
-  if (authHeader !== `Bearer ${cronSecret}`) {
+  // Fail CLOSED: a missing/empty secret must never accept `Bearer undefined`/`Bearer ` (code review v1).
+  if (!cronSecret || authHeader !== `Bearer ${cronSecret}`) {
     return new Response('Unauthorized', { status: 401 })
   }
 
@@ -120,8 +121,13 @@ Deno.serve(async (req: Request) => {
   const model = new Supabase.ai.Session('gte-small')
 
   // 1. Producer: enqueue jobs for extracted docs + purge stale chunks (RPC returns void).
+  // The producer also runs the stale-chunk purge — a safety precondition. If it fails, stop before
+  // claiming rather than proceeding on stale state (code review v1).
   const { error: enqErr } = await supabaseAdmin.rpc('enqueue_embedding_jobs')
-  if (!enqErr) enqueued = 1
+  if (enqErr) {
+    return Response.json({ error: 'enqueue_failed' }, { status: 500 })
+  }
+  enqueued = 1
 
   async function complete(
     job: ClaimedJob,
