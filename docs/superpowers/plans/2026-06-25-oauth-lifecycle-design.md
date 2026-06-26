@@ -3,7 +3,7 @@
 **Date:** 2026-06-25  
 **Slug:** oauth-lifecycle  
 **Branch:** plan/oauth-lifecycle  
-**Status:** Draft — awaiting Codex plan review  
+**Status:** Revised after Codex plan review v1
 
 ---
 
@@ -12,6 +12,7 @@
 | Rev | Date | Summary |
 |-----|------|---------|
 | 1 | 2026-06-25 | Initial spec from brainstorm |
+| 2 | 2026-06-25 | Codex plan review v1 — fixed constraint name, revoke error handling, vault_delete_secret grants, reconnect JWT binding, GET→POST initiate, callback conflict target, test gaps, rollback note, safety criteria |
 
 ---
 
@@ -32,7 +33,7 @@ Make a Gmail connection survive being broken and let the user control it. Four c
 |---|----------|-----------|
 | D1 | Disconnect shows a consent modal: keep data or purge data | Emails may be important for downstream file creation; company may want to retain them even when the connection is paused |
 | D2 | Delete always purges (cascade), no choice offered | Delete is destructive by intent |
-| D3 | Always attempt Google revoke on disconnect and delete; treat any `4xx` as success | Leaving a live Google authorization dangling is worse than a redundant revoke call |
+| D3 | Always attempt Google revoke on disconnect and delete; treat `2xx` and terminal `4xx` (400/401/403) as success; retain token and return error on `5xx` or network failure | Leaving a live Google authorization dangling is worse than a redundant revoke call; but losing the token before a successful revoke is also a failure mode |
 | D4 | Reconnect always sends `prompt=consent` | Guarantees a fresh refresh token; silent reuse risks returning the same dead grant |
 
 ---
@@ -43,6 +44,19 @@ Make a Gmail connection survive being broken and let the user control it. Four c
 - Service layer is the only browser path to Supabase
 - RLS: SELECT-own only on `connected_accounts`, no authenticated write policies
 - Vault delete helper does not yet exist — must be created in this epic
+- Vault secret key is raw `account.id` (matching existing callback and collector code — do not rename)
+
+---
+
+## Safety rules compliance
+
+All five mandatory rules from `docs/project-brief.md` apply to this epic:
+
+1. **Token isolation** — refresh tokens read from Vault inside edge functions only; never returned to browser; `vault_delete_secret` called after successful revoke
+2. **Read-only browser** — all writes (UPDATE status, DELETE messages, DELETE connected_accounts) happen in edge functions under service role; no new authenticated write policies
+3. **PII containment** — collected emails are never sent to any third-party service; purge/delete remove them from Supabase only
+4. **Secrets out of git** — no tokens, keys, or secrets committed; Vault is the secret store
+5. **Untrusted content** — no email content is processed in this epic; note carried forward for Epic 07
 
 ---
 
@@ -52,13 +66,22 @@ Make a Gmail connection survive being broken and let the user control it. Four c
 
 **File:** `supabase/migrations/<timestamp>_provider_aware_unique_key.sql`
 
-```sql
--- Drop the existing unique constraint (user_id, email_address)
--- Add new unique constraint (user_id, provider, email_address)
--- Idempotent: use DO-block guard (per migration 20260618000002 pattern)
+**Actual constraint name** (confirmed from `20260617000001_initial_schema.sql` line 15): `connected_accounts_user_email_unique`
 
+```sql
+-- Drop the actual existing constraint, guard both possible names for safety
 DO $$
 BEGIN
+  IF EXISTS (
+    SELECT 1 FROM pg_constraint
+    WHERE conname = 'connected_accounts_user_email_unique'
+      AND conrelid = 'public.connected_accounts'::regclass
+  ) THEN
+    ALTER TABLE public.connected_accounts
+      DROP CONSTRAINT connected_accounts_user_email_unique;
+  END IF;
+
+  -- Also guard the alternative name in case of prior partial migration
   IF EXISTS (
     SELECT 1 FROM pg_constraint
     WHERE conname = 'connected_accounts_user_id_email_address_key'
@@ -95,7 +118,7 @@ END $$;
 
 ### New helper: `vault_delete_secret`
 
-The existing Vault helpers (`vault_create_secret`, `vault_update_secret`, `vault_get_secret`, `vault_get_secret_id`) have no delete. This epic adds one.
+The existing Vault helpers (`vault_create_secret`, `vault_update_secret`, `vault_get_secret`, `vault_get_secret_id`) have no delete. This epic adds one, following the exact grant pattern in `20260617000002_vault_helpers.sql`.
 
 **Migration 2 — vault delete helper**
 
@@ -110,9 +133,13 @@ BEGIN
   DELETE FROM vault.secrets WHERE name = secret_name;
 END;
 $$;
+
+-- Match the grant pattern from 20260617000002_vault_helpers.sql
+REVOKE ALL ON FUNCTION vault_delete_secret(text) FROM PUBLIC;
+GRANT EXECUTE ON FUNCTION vault_delete_secret(text) TO service_role;
 ```
 
-The secret is keyed by `connected_account_id` in the existing pattern (e.g. `google_refresh_token_<account_id>`). The edge function resolves this name and calls the helper.
+**Vault secret naming:** secrets are keyed by raw `account.id` (matching existing `google-oauth-callback` and `gmail-collector` code). Do not introduce a prefixed naming scheme in this epic.
 
 ---
 
@@ -133,16 +160,21 @@ The secret is keyed by `connected_account_id` in the existing pattern (e.g. `goo
 **Steps:**
 1. Verify JWT — extract `user_id`
 2. Fetch the `connected_accounts` row for `(user_id, accountId)` — 404 if not found or not owned
-3. Fetch refresh token from Vault
-4. Call `https://oauth2.googleapis.com/revoke?token=<refresh_token>` — treat any response (including `4xx`) as success; log the status
+3. Fetch refresh token from Vault by `account.id`
+4. POST to `https://oauth2.googleapis.com/revoke` with `Content-Type: application/x-www-form-urlencoded` body `token=<refresh_token>` (not query string — avoids token in logs)
+   - `2xx` → success, proceed
+   - `400 / 401 / 403` → terminal failure at Google (token already dead), treat as success, proceed
+   - `5xx` or network error → return `502` to browser; retain Vault token for retry; do NOT update status or purge
 5. If `purgeMessages === true`: `DELETE FROM messages WHERE connected_account_id = accountId` (service role)
 6. `UPDATE connected_accounts SET status = 'revoked', sync_cursor = NULL WHERE id = accountId` (service role)
-7. Call `vault_delete_secret` to remove the refresh token
+7. Call `vault_delete_secret(account.id)` to remove the refresh token
 8. Return `200 { success: true }`
 
 **Error handling:**
-- Vault fetch fails (token already gone): proceed with revoke attempt using empty string — Google will 400, treat as success
-- DB errors: return `500`
+- Vault fetch fails (token already gone): POST revoke with empty token — Google returns 400, treat as terminal success, proceed
+- Step 5/6/7 DB errors: return `500`; status may be inconsistent — acceptable, user can retry
+
+**Collector race:** The `gmail-collector` re-checks `status = 'active'` before writing messages (verified in existing code). A disconnect that sets `status = 'revoked'` before the collector's next write will prevent reinserts. No additional locking needed.
 
 ### New function: `google-account-delete`
 
@@ -158,21 +190,26 @@ The secret is keyed by `connected_account_id` in the existing pattern (e.g. `goo
 **Steps:**
 1. Verify JWT — extract `user_id`
 2. Fetch the `connected_accounts` row — 404 if not found or not owned
-3. Fetch refresh token from Vault
-4. Call Google revoke — treat `4xx` as success
-5. `DELETE FROM connected_accounts WHERE id = accountId` — cascades to `messages` automatically (FK on delete cascade already exists)
-6. Call `vault_delete_secret`
+3. Fetch refresh token from Vault by `account.id`
+4. POST to Google revoke (same as disconnect — body, not query string; same terminal/retry logic)
+   - On `5xx` / network error: return `502`; do NOT delete
+5. `DELETE FROM connected_accounts WHERE id = accountId` — cascades to `messages` via FK on delete cascade
+6. Call `vault_delete_secret(account.id)`
 7. Return `200 { success: true }`
 
 ### Modified function: `google-oauth-initiate`
 
-**Change:** Read `provider` from query param instead of hardcoding. For reconnect, the frontend passes `?provider=google&reconnect=true`. When `reconnect=true`, the state JWT carries a flag and the initiate function ensures `prompt=consent` is in the Google redirect URL.
+**Reconnect path change:** Accept `reconnect=true` and `accountId=<uuid>` in the POST body (not GET query params — must carry Supabase JWT via Authorization header like existing calls).
 
-Currently `prompt=consent` is already in the initiate flow for new connections — no change needed there. The reconnect path just needs to confirm the account being reconnected belongs to the calling user before redirecting.
+**Steps for reconnect:**
+1. Verify JWT — extract `user_id`
+2. Fetch `connected_accounts` row for `(user_id, accountId)` — 404 if not owned
+3. Embed `reconnect_account_id` and `provider` in the signed state JWT alongside `user_id` and nonce
+4. Redirect to Google with `prompt=consent` (already present for new connections)
 
-**Reconnect input:** `GET /google-oauth-initiate?reconnect=true&accountId=<uuid>`
+**Callback update (EU-26-8):** `google-oauth-callback` currently upserts with `onConflict: 'user_id,email_address'` (line 156). After Migration 1 removes that constraint, this will fail. Must update to `onConflict: 'user_id,provider,email_address'` and deploy alongside the migration.
 
-Additional step for reconnect: verify `connected_accounts` row ownership before redirecting. On successful callback, the existing upsert logic handles updating the token in Vault.
+**Reconnect validation in callback:** When `reconnect_account_id` is present in the state JWT, verify the Google-returned email matches the `email_address` on the `connected_accounts` row. If mismatch, return `400` — prevents authorizing account B when reconnecting account A.
 
 ---
 
@@ -183,7 +220,9 @@ Additional step for reconnect: verify `connected_accounts` row ownership before 
 New methods:
 - `disconnectAccount(accountId: string, purgeMessages: boolean): Promise<void>` — POST to `google-account-disconnect`
 - `deleteAccount(accountId: string): Promise<void>` — POST to `google-account-delete`
-- `reconnectAccount(accountId: string): Promise<void>` — GET initiate with `reconnect=true&accountId=<uuid>` (redirects browser)
+- `reconnectAccount(accountId: string): Promise<{ url: string }>` — POST to `google-oauth-initiate` with `{ reconnect: true, accountId }`, then redirects browser to returned URL
+
+All three use `supabase.functions.invoke()` to carry the Supabase JWT automatically.
 
 ---
 
@@ -194,7 +233,7 @@ New methods:
 **Current state:** reconnect is hardcoded to `google`. No disconnect or delete UI.
 
 **Changes:**
-1. **Reconnect button** — reads `provider` from the account row, passes it through. Visible when `status === 'error' || status === 'revoked'`.
+1. **Reconnect button** — reads `provider` from the account row. Visible when `status === 'error' || status === 'revoked'`.
 2. **Disconnect button** — visible when `status === 'active'`. Opens the disconnect modal.
 3. **Delete button** — always visible (with appropriate warning styling). Opens a delete confirmation modal.
 
@@ -242,9 +281,24 @@ No new RLS policies. All writes (UPDATE status, DELETE messages, DELETE connecte
 
 ## Tests
 
-- `DisconnectModal.test.tsx` — renders both radio options, default is keep, confirm button disabled until option confirmed, calls `disconnectAccount` with correct `purgeMessages` value
-- `DeleteAccountModal.test.tsx` — renders warning copy, confirm button calls `deleteAccount`
-- `accounts.service.test.ts` — `disconnectAccount` and `deleteAccount` call the correct edge function endpoints with correct bodies
+**Component tests:**
+- `DisconnectModal.test.tsx` — renders both radio options; keep is default; confirm disabled until selection confirmed; calls `disconnectAccount` with correct `purgeMessages`; cancel closes modal without calling service
+- `DeleteAccountModal.test.tsx` — renders warning copy; confirm calls `deleteAccount`; cancel closes without action
+
+**Service tests (`accounts.service.test.ts`):**
+- `disconnectAccount` POSTs to correct endpoint with `{ accountId, purgeMessages }`
+- `deleteAccount` POSTs to correct endpoint with `{ accountId }`
+- `reconnectAccount` POSTs to initiate with `{ reconnect: true, accountId }` and redirects to returned URL
+
+**Edge function unit tests (mocked fetch):**
+- Disconnect: cross-user `accountId` returns 404
+- Disconnect: Google `5xx` returns 502, does not update status or purge messages
+- Disconnect: Google `400` proceeds with purge and status update
+- Disconnect: Vault token missing → empty-token revoke → 400 → proceeds
+- Delete: cross-user `accountId` returns 404
+- Delete: Google `5xx` returns 502, does not delete row
+- Reconnect callback: email mismatch on reconnect returns 400
+- No token or account data logged at any severity level
 
 ---
 
@@ -256,11 +310,14 @@ No new RLS policies. All writes (UPDATE status, DELETE messages, DELETE connecte
 4. If purge was selected, messages for that account are gone from the `messages` table
 5. If keep was selected, messages remain
 6. A user with a `revoked` or `error` account sees a Reconnect button; clicking it redirects to Google with `prompt=consent`
-7. After reconnect, the account returns to `active` status with a fresh token in Vault
-8. Clicking Delete opens `DeleteAccountModal`; confirming removes the `connected_accounts` row and cascades messages
-9. Google's revoke endpoint is called on both disconnect and delete; a `4xx` response does not block local cleanup
-10. `UNIQUE (user_id, provider, email_address)` constraint is applied and replaces the old `(user_id, email_address)` constraint
-11. `vault_delete_secret` helper exists and is called on both disconnect and delete
+7. After reconnect, the Google-returned email matches the account being reconnected; mismatch returns an error
+8. After successful reconnect, the account returns to `active` status with a fresh token in Vault
+9. Clicking Delete opens `DeleteAccountModal`; confirming removes the `connected_accounts` row and cascades messages
+10. Google's revoke endpoint is called via POST (not GET); a terminal `4xx` does not block local cleanup; a `5xx` blocks cleanup and retains the Vault token
+11. `UNIQUE (user_id, provider, email_address)` constraint is applied and replaces `connected_accounts_user_email_unique`
+12. `google-oauth-callback` conflict target updated to `user_id,provider,email_address` and deployed alongside Migration 1
+13. `vault_delete_secret` helper exists, grants execute to `service_role` only, and is called on both disconnect and delete
+14. All five mandatory safety rules are satisfied (token isolation, read-only browser, PII containment, secrets out of git, untrusted content noted)
 
 ---
 
@@ -268,21 +325,22 @@ No new RLS policies. All writes (UPDATE status, DELETE messages, DELETE connecte
 
 1. Migration 1 (provider-aware unique key) — `npx supabase db push --linked` → confirm Remote column → `npm run gen:types`
 2. Migration 2 (vault_delete_secret helper) — same gate
-3. Deploy `google-account-disconnect` edge function
-4. Deploy `google-account-delete` edge function
-5. Deploy modified `google-oauth-initiate` edge function
-6. Frontend changes (AccountCard, DisconnectModal, DeleteAccountModal, hooks, service)
+3. Deploy `google-oauth-callback` with updated conflict target (EU-26-8) — **must deploy before or alongside Migration 1 going live**
+4. Deploy `google-account-disconnect` edge function
+5. Deploy `google-account-delete` edge function
+6. Deploy modified `google-oauth-initiate` edge function (reconnect support)
+7. Frontend changes (AccountCard, DisconnectModal, DeleteAccountModal, hooks, service)
 
-Frontend changes depend on the edge functions being deployed. Migrations must precede everything.
+**Critical ordering note:** Steps 1 and 3 are coupled. The callback update must be deployed at the same time as the migration is applied, or new OAuth connections will fail in the window between them.
 
 ---
 
 ## Rollback
 
-- Migrations: the provider-aware key migration is reversible (drop new constraint, re-add old). Create a new migration — never edit the applied one.
-- Edge functions: Supabase keeps prior versions; redeploy the previous version from git.
-- Frontend: revert the PR.
-- The `vault_delete_secret` helper is additive; no rollback needed unless it causes problems.
+- **Migrations:** provider-aware key migration is reversible (drop new constraint, re-add old via new migration — never edit applied). `vault_delete_secret` is additive; drop with a new migration if needed.
+- **Edge functions:** Supabase keeps prior versions; redeploy from git.
+- **Frontend:** revert the PR.
+- **Irreversible operations:** purge (disconnect with delete) and account delete permanently remove PII from `messages` and `connected_accounts`. These cannot be recovered from application code — only from Supabase PITR (point-in-time recovery). Before this epic ships, confirm PITR is enabled on the project and document the recovery path in the run sheet.
 
 ---
 
@@ -290,4 +348,5 @@ Frontend changes depend on the edge functions being deployed. Migrations must pr
 
 - Microsoft / non-Google providers (Epic schema-standardization, deferred)
 - Disconnect/delete for Drive accounts (Epic 04)
-- Any changes to the collector edge function (it already handles `invalid_grant` → `status = 'error'`)
+- Batched purge for very large accounts (noted as future work — acceptable limitation at demo scale)
+- Collector race handling beyond the existing `status = 'active'` check (already sufficient)
