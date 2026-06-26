@@ -17,6 +17,7 @@
 | 4 | 2026-06-25 | Codex plan review v3 — mismatch revoke on reconnect, atomic collector write guard, disconnect status ordering (revoke-then-mark), gen:types after every migration |
 | 5 | 2026-06-25 | Codex plan review v4 — pg_advisory_xact_lock for collector/disconnect race, gen:types after Migration 1b |
 | 6 | 2026-06-25 | Codex plan review v5 — RPC-based atomic operations (advisory lock only works in single transaction), reconnect callback updates by ID not email upsert |
+| 7 | 2026-06-25 | Codex plan review v6 — REVOKE/GRANT on RPCs, deploy collector before lifecycle fns, fix BEGIN/COMMIT → BEGIN...END in PL/pgSQL |
 
 ---
 
@@ -189,33 +190,58 @@ GRANT EXECUTE ON FUNCTION vault_delete_secret(text) TO service_role;
 
 EU-26-9 adds two RPC functions (Migration 3):
 
-**`collect_account_messages(p_account_id uuid, p_messages jsonb, p_new_cursor text)`**
+All three RPC functions follow the vault helper grant pattern — service_role only, no browser access:
+
 ```sql
-BEGIN;
-  PERFORM pg_advisory_xact_lock(hashtext(p_account_id::text));
-  -- Re-check status inside the transaction
-  IF NOT EXISTS (SELECT 1 FROM connected_accounts WHERE id = p_account_id AND status = 'active') THEN
-    RETURN; -- account revoked mid-run; skip silently
-  END IF;
-  -- Upsert messages (expand p_messages jsonb to rows)
-  -- Update sync_cursor
-COMMIT;
+REVOKE ALL ON FUNCTION fn_name(...) FROM PUBLIC, anon, authenticated;
+GRANT EXECUTE ON FUNCTION fn_name(...) TO service_role;
 ```
 
-**`lifecycle_disconnect(p_account_id uuid, p_user_id uuid, p_purge boolean)`**
+**`collect_account_messages(p_account_id uuid, p_messages jsonb, p_new_cursor text) RETURNS void`**
 ```sql
-BEGIN;
+CREATE OR REPLACE FUNCTION collect_account_messages(...)
+RETURNS void LANGUAGE plpgsql SECURITY DEFINER AS $$
+BEGIN
   PERFORM pg_advisory_xact_lock(hashtext(p_account_id::text));
-  -- Verify ownership
+  IF NOT EXISTS (
+    SELECT 1 FROM connected_accounts WHERE id = p_account_id AND status = 'active'
+  ) THEN
+    RETURN; -- account revoked mid-run; skip silently
+  END IF;
+  -- Upsert messages from p_messages jsonb
+  -- Update sync_cursor on connected_accounts
+END;
+$$;
+```
+
+**`lifecycle_disconnect(p_account_id uuid, p_user_id uuid, p_purge boolean) RETURNS void`**
+```sql
+CREATE OR REPLACE FUNCTION lifecycle_disconnect(...)
+RETURNS void LANGUAGE plpgsql SECURITY DEFINER AS $$
+BEGIN
+  PERFORM pg_advisory_xact_lock(hashtext(p_account_id::text));
   UPDATE connected_accounts SET status = 'revoked', sync_cursor = NULL
     WHERE id = p_account_id AND user_id = p_user_id;
   IF p_purge THEN
     DELETE FROM messages WHERE connected_account_id = p_account_id;
   END IF;
-COMMIT;
+END;
+$$;
 ```
 
-Similarly, `google-account-delete` calls a `lifecycle_delete(p_account_id, p_user_id)` RPC that does the lock + DELETE in one transaction. The edge functions call Google revoke and Vault operations (which are external — cannot be inside a Postgres transaction) before calling the RPC for the local DB work.
+**`lifecycle_delete(p_account_id uuid, p_user_id uuid) RETURNS void`**
+```sql
+CREATE OR REPLACE FUNCTION lifecycle_delete(...)
+RETURNS void LANGUAGE plpgsql SECURITY DEFINER AS $$
+BEGIN
+  PERFORM pg_advisory_xact_lock(hashtext(p_account_id::text));
+  DELETE FROM connected_accounts WHERE id = p_account_id AND user_id = p_user_id;
+  -- cascades to messages via FK
+END;
+$$;
+```
+
+Note: No `BEGIN;`/`COMMIT;` SQL transaction commands inside PL/pgSQL functions — the RPC call itself is the transaction boundary. `BEGIN...END` is PL/pgSQL block syntax only. The edge functions call Google revoke and Vault operations (external — cannot be inside a Postgres transaction) before calling the RPC for local DB work.
 
 ### New function: `google-account-delete`
 
@@ -383,11 +409,13 @@ Migration 1 is split into 1a and 1b to eliminate the deployment window where the
 3. **EU-26-8** — Deploy `google-oauth-callback` with updated conflict target (`user_id,provider,email_address`) and reconnect email-match validation
 4. **Migration 1b** — DROP `connected_accounts_user_email_unique` (now safe — callback already uses new target) → confirm Remote column → `npm run gen:types`
 5. **Migration 3** — RPC functions (`collect_account_messages`, `lifecycle_disconnect`, `lifecycle_delete`) → confirm Remote column → `npm run gen:types`
-6. Deploy `google-account-disconnect` edge function
-7. Deploy `google-account-delete` edge function
-8. Deploy modified `google-oauth-initiate` (reconnect support)
-9. Deploy modified `gmail-collector` (uses `collect_account_messages` RPC)
+6. Deploy modified `gmail-collector` (uses `collect_account_messages` RPC) — **must deploy before lifecycle edge functions so the lock is active before disconnect/delete are exposed**
+7. Deploy modified `google-oauth-initiate` (reconnect support)
+8. Deploy `google-account-disconnect` edge function
+9. Deploy `google-account-delete` edge function
 10. Frontend changes (AccountCard, DisconnectModal, DeleteAccountModal, hooks, service)
+
+**Critical ordering note:** Step 6 must precede steps 8–9. During any window where lifecycle endpoints exist but the collector is still writing unguarded, a purge can be followed by reinserts. Deploy collector first, verify it is running the RPC path, then expose disconnect/delete.
 
 **Why this order is safe:** Step 1a means both constraints exist simultaneously. The old callback still works (old constraint present). Step 3 deploys the updated callback which uses the new constraint. Step 4 removes the old constraint — by this point no code references it. Zero downtime, no window where connections can fail.
 
