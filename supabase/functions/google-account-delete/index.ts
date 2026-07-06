@@ -76,7 +76,7 @@ Deno.serve(async (req: Request) => {
   // Fetch account — verify ownership
   const { data: account, error: fetchErr } = await supabaseAdmin
     .from('connected_accounts')
-    .select('id, user_id, lifecycle_version')
+    .select('id, user_id, lifecycle_version, status')
     .eq('id', accountId)
     .eq('user_id', user.id)
     .single()
@@ -85,27 +85,30 @@ Deno.serve(async (req: Request) => {
     return Response.json({ error: 'Account not found' }, { status: 404, headers: corsHeaders })
   }
 
-  // Fetch refresh token from Vault
-  const { data: refreshToken, error: vaultErr } = await supabaseAdmin
-    .rpc('get_vault_secret', { secret_name: account.id })
+  // Only an ACTIVE account still has a live Google grant + a Vault token to revoke. A 'revoked'
+  // (already disconnected) or 'error' account had its token revoked + deleted already, so there is
+  // nothing to revoke — skip straight to deletion. (Previously the missing-token guard wrongly
+  // blocked deleting a disconnected account with a 'no_vault_token' error.)
+  if (account.status === 'active') {
+    const { data: refreshToken, error: vaultErr } = await supabaseAdmin
+      .rpc('get_vault_secret', { secret_name: account.id })
 
-  if (vaultErr) {
-    console.error('Vault fetch error:', JSON.stringify(vaultErr))
-    return Response.json({ error: 'Failed to access vault' }, { status: 502, headers: corsHeaders })
-  }
-  if (!refreshToken) {
-    // No Vault secret — we cannot verify the Google grant is dead. Require manual revoke.
-    return Response.json(
-      { error: 'no_vault_token', message: 'Revoke access at myaccount.google.com/permissions, then retry.' },
-      { status: 502, headers: corsHeaders },
-    )
-  }
-  const tokenToRevoke: string = refreshToken
-
-  // Revoke Google token — on 5xx/network error, abort (do NOT delete)
-  const revoke = await revokeGoogleToken(tokenToRevoke)
-  if (!revoke.ok) {
-    return Response.json({ error: 'Google revoke failed. Please try again.' }, { status: 502, headers: corsHeaders })
+    if (vaultErr) {
+      console.error('Vault fetch error:', JSON.stringify(vaultErr))
+      return Response.json({ error: 'Failed to access vault' }, { status: 502, headers: corsHeaders })
+    }
+    if (!refreshToken) {
+      // Active account but no Vault secret — we cannot verify the Google grant is dead. Require manual revoke.
+      return Response.json(
+        { error: 'no_vault_token', message: 'Revoke access at myaccount.google.com/permissions, then retry.' },
+        { status: 502, headers: corsHeaders },
+      )
+    }
+    // Revoke Google token — on 5xx/network error, abort (do NOT delete)
+    const revoke = await revokeGoogleToken(refreshToken)
+    if (!revoke.ok) {
+      return Response.json({ error: 'Google revoke failed. Please try again.' }, { status: 502, headers: corsHeaders })
+    }
   }
 
   // Call lifecycle_delete RPC — atomic with version check, cascades messages

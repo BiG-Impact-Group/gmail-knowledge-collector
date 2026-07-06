@@ -23,7 +23,7 @@ import * as XLSX from 'https://esm.sh/xlsx@0.18.5'
 const GOOGLE_TOKEN_URL = 'https://oauth2.googleapis.com/token'
 const DRIVE_API = 'https://www.googleapis.com/drive/v3'
 
-const MAX_JOBS_PER_RUN = 3
+const MAX_JOBS_PER_RUN = 8      // raised from 3 — clear the backlog faster (deadline still gates)
 const STALE_SECONDS = 600
 const MAX_ATTEMPTS = 3
 const MAX_FILE_BYTES = 10_000_000
@@ -32,7 +32,7 @@ const MAX_ZIP_ENTRIES = 2000
 const MAX_MARKDOWN_BYTES = 1_000_000
 const MAX_PDF_PAGES = 200
 const MAX_XLSX_CELLS = 200_000
-const RUN_DEADLINE_MS = 50_000
+const RUN_DEADLINE_MS = 110_000  // raised from 50s — process more per invocation (well under the platform wall-clock)
 
 const DOCX_MIME = 'application/vnd.openxmlformats-officedocument.wordprocessingml.document'
 const XLSX_MIME = 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet'

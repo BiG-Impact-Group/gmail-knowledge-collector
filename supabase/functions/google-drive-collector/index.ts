@@ -41,6 +41,20 @@ const BINARY_PROCESSING_TYPES = new Set([
   'application/rtf',
 ])
 
+// Drive entries that are NOT documents and must never be ingested as rows (folders, shortcuts,
+// and any other Workspace container type that isn't an exportable doc). They only clutter the
+// viewer with "No content" rows.
+const NON_DOCUMENT_TYPES = new Set([
+  'application/vnd.google-apps.folder',
+  'application/vnd.google-apps.shortcut',
+])
+
+// Any text/* MIME is extractable as plain text (covers text/x-sql, text/tab-separated-values,
+// text/yaml, etc. — not just the explicit list above).
+function isNativeText(mimeType: string): boolean {
+  return NATIVE_TEXT_TYPES.has(mimeType) || mimeType.startsWith('text/')
+}
+
 interface DriveFile {
   id?: string
   name?: string
@@ -85,7 +99,7 @@ function classifyFile(mimeType: string, sizeBytes: number | null): { action: Cla
   if (WORKSPACE_EXPORTS[mimeType]) {
     return { action: 'export_workspace', exportMimeType: WORKSPACE_EXPORTS[mimeType] }
   }
-  if (NATIVE_TEXT_TYPES.has(mimeType)) {
+  if (isNativeText(mimeType)) {
     if (sizeBytes !== null && sizeBytes > MAX_CONTENT_BYTES) return { action: 'needs_processing' }
     return { action: 'download_text' }
   }
@@ -213,6 +227,9 @@ async function extractContent(
 // the file is never silently dropped while the cursor advances past it.
 async function buildDocRow(accessToken: string, account: ConnectedAccountRow, file: DriveFile): Promise<DocRow | null> {
   if (!file.id || !file.name || !file.mimeType) return null
+  // Folders/shortcuts are not documents — never ingest them (guards the incremental Changes path,
+  // which can't pre-filter by MIME the way the backfill query does).
+  if (NON_DOCUMENT_TYPES.has(file.mimeType)) return null
   const sizeBytes = file.size ? parseInt(file.size, 10) : null
   const classification = classifyFile(file.mimeType, sizeBytes)
 
@@ -373,7 +390,7 @@ Deno.serve(async (req: Request) => {
 
         while (pagesThisRun < MAX_PAGES_PER_RUN) {
           const params = new URLSearchParams({
-            q: 'trashed=false',
+            q: "trashed=false and mimeType != 'application/vnd.google-apps.folder'",
             fields: 'nextPageToken,files(id,name,mimeType,webViewLink,size,modifiedTime)',
             pageSize: String(DRIVE_PAGE_SIZE),
             corpora: 'user',
