@@ -33,9 +33,9 @@ function makeAccount(overrides: Partial<ConnectedAccount>): ConnectedAccount {
 beforeEach(() => jest.clearAllMocks())
 
 describe('AccountCard', () => {
-  it('renders the Google label for a Gmail account', () => {
+  it('renders the Gmail label for a Gmail account', () => {
     render(<AccountCard account={makeAccount({ provider: 'google' })} />)
-    expect(screen.getByText('Google')).toBeInTheDocument()
+    expect(screen.getByText('Gmail')).toBeInTheDocument()
   })
 
   it('renders the Google Drive label for a Drive account', () => {

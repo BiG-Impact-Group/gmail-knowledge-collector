@@ -38,7 +38,7 @@ export default function AccountCard({ account }: Props) {
   const canDisconnect = account.status === 'active' || account.status === 'error'
 
   const isDrive = account.provider === 'google_drive'
-  const providerLabel = isDrive ? 'Google Drive' : 'Google'
+  const providerLabel = isDrive ? 'Google Drive' : 'Gmail'
   const providerIcon = isDrive ? '📁' : '✉️'
 
   async function handleReconnect() {
