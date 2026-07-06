@@ -23,11 +23,19 @@ declare const Supabase: {
   ai: { Session: new (model: string) => { run: (input: string, opts: Record<string, unknown>) => Promise<unknown> } }
 }
 
-const MAX_JOBS_PER_RUN = 25     // raised from 2 — gte-small is fast; clear the embedding backlog
-const MAX_CHUNKS_PER_DOC = 50
+// Edge Functions enforce a HARD 2s CPU-time limit per request (wall clock is separate, 150/400s).
+// In-boundary gte-small inference is CPU-bound, so the binding constraint is "embeddings computed
+// per request", NOT wall time. Empirically a single large doc (~50 chunks) alone exceeds 2s CPU and
+// the worker is killed (HTTP 546) before committing anything. So we process exactly ONE document per
+// request and cap chunks per doc so a single invocation always finishes and commits atomically under
+// the CPU budget. Throughput comes from firing many PARALLEL invocations (each a fresh isolate with
+// its own 2s budget) via the cron, not from a big per-request batch.
+const MAX_JOBS_PER_RUN = 1
+const MAX_CHUNKS_PER_DOC = 15   // 15 * 1500 chars ≈ 22.5K chars/doc; fits comfortably in 2s CPU.
+                                // Longer docs are embedded up to this cap and flagged truncated.
 const STALE_SECONDS = 600
 const MAX_ATTEMPTS = 3
-const RUN_DEADLINE_MS = 110_000  // raised from 45s — embed many docs per invocation (under wall-clock)
+const RUN_DEADLINE_MS = 8_000   // wall guard well under platform limits; CPU is the real ceiling
 const CHUNK_TARGET_CHARS = 1500
 const CHUNK_OVERLAP_CHARS = 200
 const MAX_CONTENT_CHARS = 200_000
