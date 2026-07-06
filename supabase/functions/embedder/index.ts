@@ -1,41 +1,29 @@
-// CONNECTOR SEAM: This function embeds extracted document text ENTIRELY IN-BOUNDARY using the
-// Supabase Edge Runtime built-in gte-small model (384-dim). NO content ever leaves the boundary —
-// no external API or model (Rule 8). It reads documents.text_content (already extracted by Epic 05),
-// chunks it, embeds each chunk, and stores vectors in `chunks` via the SECURITY DEFINER RPC
-// complete_embedding_job. Embedding is best-effort: it NEVER mutates documents.
+// Embeds extracted document text IN-BOUNDARY via Supabase.ai gte-small (384-dim). No content leaves
+// the boundary (Rule 8). Reads documents.text_content, chunks it, embeds, stores vectors in `chunks`
+// via the SECURITY DEFINER progress_embedding_job RPC. Best-effort: NEVER mutates documents. No PII
+// in logs. `Supabase.ai` is a runtime global (not importable).
 //
-// All job-state writes go through the lease-guarded RPCs claim_embedding_jobs /
-// complete_embedding_job — NEVER a direct .from('embedding_jobs').update() — and complete derives
-// the document from the job and rechecks lifecycle + content version before writing chunks.
+// RESUMABLE DESIGN (fix for the 2s edge CPU limit): Edge Functions enforce a hard ~2s CPU budget
+// per request, and gte-small inference is CPU-bound. Production evidence: any request embedding a
+// whole doc (15+ chunks) was killed with 546 WORKER_RESOURCE_LIMIT — even solo. Only 1–2 chunk
+// requests ever completed. So each request claims ONE job, embeds CHUNKS_PER_REQUEST chunks from
+// the job's next_chunk_index cursor, and commits that batch ('progress' advances the cursor and
+// releases the job; 'done' finishes it). Progress is monotonic — a killed request loses only its
+// in-flight batch. Throughput comes from many small invocations (cron fires several per tick).
 //
-// NEVER log document text or file names. Errors carry fixed codes only (Rule: no PII in logs).
-//
-// The pure chunker (chunkText) is also kept in src/lib/chunking.ts and unit-tested under Jest; the
-// logic is duplicated inline here because edge functions cannot import from src/.
-//
-// `Supabase.ai` is a runtime global in the Supabase Edge Runtime — it is NOT importable. Declared
-// below so this file type-checks under tsc.
+// The pure chunker (chunkText) mirrors src/lib/chunking.ts (edge functions cannot import from src/).
 
 import { createClient } from 'https://esm.sh/@supabase/supabase-js@2'
 
-// Supabase Edge Runtime global (not importable). Provides the in-boundary inference session.
 declare const Supabase: {
   ai: { Session: new (model: string) => { run: (input: string, opts: Record<string, unknown>) => Promise<unknown> } }
 }
 
-// Edge Functions enforce a HARD 2s CPU-time limit per request (wall clock is separate, 150/400s).
-// In-boundary gte-small inference is CPU-bound, so the binding constraint is "embeddings computed
-// per request", NOT wall time. Empirically a single large doc (~50 chunks) alone exceeds 2s CPU and
-// the worker is killed (HTTP 546) before committing anything. So we process exactly ONE document per
-// request and cap chunks per doc so a single invocation always finishes and commits atomically under
-// the CPU budget. Throughput comes from firing many PARALLEL invocations (each a fresh isolate with
-// its own 2s budget) via the cron, not from a big per-request batch.
-const MAX_JOBS_PER_RUN = 1
-const MAX_CHUNKS_PER_DOC = 15   // 15 * 1500 chars ≈ 22.5K chars/doc; fits comfortably in 2s CPU.
-                                // Longer docs are embedded up to this cap and flagged truncated.
-const STALE_SECONDS = 600
-const MAX_ATTEMPTS = 3
-const RUN_DEADLINE_MS = 8_000   // wall guard well under platform limits; CPU is the real ceiling
+const CHUNKS_PER_REQUEST = 2    // empirically proven to fit the 2s CPU budget (incl. model init)
+const MAX_CHUNKS_PER_DOC = 50   // total per-document cap across all requests; excess → truncated
+const STALE_SECONDS = 180       // a lease only covers one small batch (~seconds); reclaim fast
+const MAX_ATTEMPTS = 3          // guards zero-progress claim loops (attempts reset on progress)
+const RUN_DEADLINE_MS = 8_000
 const CHUNK_TARGET_CHARS = 1500
 const CHUNK_OVERLAP_CHARS = 200
 const MAX_CONTENT_CHARS = 200_000
@@ -101,6 +89,7 @@ interface ClaimedJob {
   connected_account_id: string
   lifecycle_version: number
   drive_modified_time: string | null
+  next_chunk_index: number
 }
 
 interface ChunkPayload { chunk_index: number; content: string; embedding: number[] }
@@ -108,7 +97,7 @@ interface ChunkPayload { chunk_index: number; content: string; embedding: number
 Deno.serve(async (req: Request) => {
   const cronSecret = Deno.env.get('CRON_SECRET')
   const authHeader = req.headers.get('Authorization')
-  // Fail CLOSED: a missing/empty secret must never accept `Bearer undefined`/`Bearer ` (code review v1).
+  // Fail CLOSED: a missing/empty secret must never accept `Bearer undefined`/`Bearer `.
   if (!cronSecret || authHeader !== `Bearer ${cronSecret}`) {
     return new Response('Unauthorized', { status: 401 })
   }
@@ -118,56 +107,49 @@ Deno.serve(async (req: Request) => {
   const supabaseAdmin = createClient(supabaseUrl, serviceRoleKey)
 
   const startedAt = Date.now()
-  let enqueued = 0
   let claimed = 0
-  let embedded_docs = 0
-  let total_chunks = 0
+  let committed_chunks = 0
+  let finished = 0
   let retried = 0
-  let complete_errors = 0
+  let rpc_errors = 0
 
-  // One in-boundary inference session per run.
   const model = new Supabase.ai.Session('gte-small')
 
-  // 1. Producer: enqueue jobs for extracted docs + purge stale chunks (RPC returns void).
-  // The producer also runs the stale-chunk purge — a safety precondition. If it fails, stop before
-  // claiming rather than proceeding on stale state (code review v1).
+  // Producer: enqueue jobs for extracted docs + purge stale chunks. Fail closed if it errors.
   const { error: enqErr } = await supabaseAdmin.rpc('enqueue_embedding_jobs')
   if (enqErr) {
     return Response.json({ error: 'enqueue_failed' }, { status: 500 })
   }
-  enqueued = 1
 
-  async function complete(
+  async function report(
     job: ClaimedJob,
-    outcome: 'done' | 'retry',
-    chunks: ChunkPayload[] | null,
+    outcome: 'progress' | 'done' | 'retry',
+    chunks: ChunkPayload[],
     truncated: boolean,
     error: string | null,
   ): Promise<boolean> {
-    const { error: rpcErr } = await supabaseAdmin.rpc('complete_embedding_job', {
+    const { error: rpcErr } = await supabaseAdmin.rpc('progress_embedding_job', {
       p_job_id: job.job_id,
       p_claimed_at: job.claimed_at,
       p_attempts: job.attempts,
       p_lifecycle_version: job.lifecycle_version,
       p_drive_modified_time: job.drive_modified_time,
       p_outcome: outcome,
-      p_chunks: chunks ?? [],
+      p_chunks: chunks,
       p_truncated: truncated,
       p_error: error,
       p_max_attempts: MAX_ATTEMPTS,
     })
     if (rpcErr) {
-      // RPC failed (deadlock abort / transient DB error). Don't count as completed — the job stays
-      // 'processing' and is reclaimed after STALE_SECONDS.
-      complete_errors++
+      // Transient DB error: the job stays 'processing' and is reclaimed after STALE_SECONDS.
+      rpc_errors++
       return false
     }
     return true
   }
 
-  // Claim ONE job at a time, only while under the run deadline and the per-run cap (mirrors
-  // file-processor). Never leases a job we won't process.
-  while (claimed < MAX_JOBS_PER_RUN && Date.now() - startedAt <= RUN_DEADLINE_MS) {
+  // ONE job, ONE small batch per request — sized to the 2s CPU budget.
+  while (claimed < 1 && Date.now() - startedAt <= RUN_DEADLINE_MS) {
     const { data: jobsData, error: claimErr } = await supabaseAdmin.rpc('claim_embedding_jobs', {
       p_limit: 1,
       p_stale_seconds: STALE_SECONDS,
@@ -187,68 +169,74 @@ Deno.serve(async (req: Request) => {
         .eq('id', job.document_id)
         .maybeSingle()
       if (docErr || !doc || !doc.text_content) {
-        await complete(job, 'retry', null, false, 'no_text')
+        await report(job, 'retry', [], false, 'no_text')
         retried++
         continue
       }
 
       const text = (doc.text_content as string).slice(0, MAX_CONTENT_CHARS)
-      // Chunk with one extra slot so we can detect overflow: if the document produces more than
-      // MAX_CHUNKS_PER_DOC chunks, drop the excess and flag truncated.
+      // Deterministic chunker → identical boundaries on every request for the same text
+      // (the claim RPC binds the job to a content version, so text can't change under us).
       const allPieces = chunkText(text, {
         targetChars: CHUNK_TARGET_CHARS,
         overlapChars: CHUNK_OVERLAP_CHARS,
-        maxChunks: MAX_CHUNKS_PER_DOC + 1,
+        maxChunks: MAX_CHUNKS_PER_DOC + 1, // +1 slot to detect overflow → truncated flag
       })
       if (allPieces.length === 0) {
-        await complete(job, 'retry', null, false, 'no_chunks')
+        await report(job, 'retry', [], false, 'no_chunks')
         retried++
         continue
       }
       const truncated = allPieces.length > MAX_CHUNKS_PER_DOC
       const pieces = truncated ? allPieces.slice(0, MAX_CHUNKS_PER_DOC) : allPieces
 
+      const cursor = job.next_chunk_index
+      if (cursor >= pieces.length) {
+        // Cursor already at/past the end (previous request committed the final batch but died
+        // before finishing, or chunking shrank). Close the job with an empty final batch.
+        const ok = await report(job, 'done', [], truncated, null)
+        if (ok) finished++
+        continue
+      }
+
+      const slice = pieces.slice(cursor, cursor + CHUNKS_PER_REQUEST)
       const payload: ChunkPayload[] = []
-      let aborted = false
-      for (let i = 0; i < pieces.length; i++) {
-        // Deadline-check before each embedding call.
-        if (Date.now() - startedAt > RUN_DEADLINE_MS) {
-          await complete(job, 'retry', null, false, 'embedding_deadline')
-          retried++
-          aborted = true
-          break
-        }
+      let failed = false
+      for (let i = 0; i < slice.length; i++) {
+        if (Date.now() - startedAt > RUN_DEADLINE_MS) break // commit what we have
         let embedding: number[]
         try {
-          const result = await model.run(pieces[i], { mean_pool: true, normalize: true })
+          const result = await model.run(slice[i], { mean_pool: true, normalize: true })
           embedding = result as number[]
         } catch {
-          await complete(job, 'retry', null, false, 'embedding_error')
-          retried++
-          aborted = true
+          failed = true
           break
         }
         if (!Array.isArray(embedding) || embedding.length !== EMBEDDING_DIM) {
-          await complete(job, 'retry', null, false, 'embedding_bad_dim')
-          retried++
-          aborted = true
+          failed = true
           break
         }
-        payload.push({ chunk_index: i, content: pieces[i], embedding })
+        payload.push({ chunk_index: cursor + i, content: slice[i], embedding })
       }
-      if (aborted) continue
 
-      const ok = await complete(job, 'done', payload, truncated, null)
+      if (payload.length === 0) {
+        // No forward progress this request → retry (attempts cap it to failed if it never moves).
+        await report(job, 'retry', [], false, failed ? 'embedding_error' : 'embedding_deadline')
+        retried++
+        continue
+      }
+
+      const isLast = !failed && cursor + payload.length >= pieces.length
+      const ok = await report(job, isLast ? 'done' : 'progress', payload, truncated, null)
       if (ok) {
-        embedded_docs++
-        total_chunks += payload.length
+        committed_chunks += payload.length
+        if (isLast) finished++
       }
     } catch {
-      // Any unexpected/transient error → retry (complete caps it to failed at max attempts).
-      await complete(job, 'retry', null, false, 'processing_error')
+      await report(job, 'retry', [], false, 'processing_error')
       retried++
     }
   }
 
-  return Response.json({ enqueued, claimed, embedded_docs, total_chunks, retried, complete_errors })
+  return Response.json({ claimed, committed_chunks, finished, retried, rpc_errors })
 })
