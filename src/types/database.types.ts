@@ -174,6 +174,7 @@ export type Database = {
           document_id: string
           id: string
           last_error: string | null
+          next_chunk_index: number
           source_version: string
           status: string
           truncated: boolean
@@ -188,6 +189,7 @@ export type Database = {
           document_id: string
           id?: string
           last_error?: string | null
+          next_chunk_index?: number
           source_version: string
           status?: string
           truncated?: boolean
@@ -202,6 +204,7 @@ export type Database = {
           document_id?: string
           id?: string
           last_error?: string | null
+          next_chunk_index?: number
           source_version?: string
           status?: string
           truncated?: boolean
@@ -368,6 +371,7 @@ export type Database = {
           drive_modified_time: string
           job_id: string
           lifecycle_version: number
+          next_chunk_index: number
           user_id: string
         }[]
       }
@@ -476,6 +480,21 @@ export type Database = {
           chunk_index: number
           similarity: number
         }[]
+      }
+      progress_embedding_job: {
+        Args: {
+          p_attempts: number
+          p_chunks: Json
+          p_claimed_at: string
+          p_drive_modified_time: string
+          p_error: string
+          p_job_id: string
+          p_lifecycle_version: number
+          p_max_attempts: number
+          p_outcome: string
+          p_truncated: boolean
+        }
+        Returns: undefined
       }
       reset_account_documents: {
         Args: { p_account_id: string; p_expected_version: number }
