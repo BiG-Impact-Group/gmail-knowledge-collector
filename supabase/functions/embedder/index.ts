@@ -23,11 +23,11 @@ declare const Supabase: {
   ai: { Session: new (model: string) => { run: (input: string, opts: Record<string, unknown>) => Promise<unknown> } }
 }
 
-const MAX_JOBS_PER_RUN = 2
+const MAX_JOBS_PER_RUN = 25     // raised from 2 — gte-small is fast; clear the embedding backlog
 const MAX_CHUNKS_PER_DOC = 50
 const STALE_SECONDS = 600
 const MAX_ATTEMPTS = 3
-const RUN_DEADLINE_MS = 45_000
+const RUN_DEADLINE_MS = 110_000  // raised from 45s — embed many docs per invocation (under wall-clock)
 const CHUNK_TARGET_CHARS = 1500
 const CHUNK_OVERLAP_CHARS = 200
 const MAX_CONTENT_CHARS = 200_000
