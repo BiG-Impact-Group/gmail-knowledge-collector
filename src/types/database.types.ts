@@ -471,7 +471,7 @@ export type Database = {
       // migration being applied. The parent regenerates database.types.ts via `npm run gen:types`
       // after `supabase db push --linked`, which will overwrite this block with the generated form.
       match_chunks: {
-        Args: { p_query_embedding: string; p_limit: number }
+        Args: { p_query_embedding: string; p_query: string; p_limit: number }
         Returns: {
           document_id: string
           document_name: string
