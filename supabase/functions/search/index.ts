@@ -133,8 +133,11 @@ Deno.serve(async (req: Request) => {
   }
 
   // Match under the caller's RLS (SECURITY INVOKER RPC). No p_user_id — isolation is RLS.
+  // p_query feeds the lexical legs of the hybrid ranker (content FTS + document-name match);
+  // the raw text goes only to Postgres in-boundary, never to any external service.
   const { data, error } = await supabase.rpc('match_chunks', {
     p_query_embedding: embedding as unknown as string,
+    p_query: query,
     p_limit: limit,
   })
   if (error) {
