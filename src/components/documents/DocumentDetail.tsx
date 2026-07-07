@@ -1,4 +1,5 @@
 import type { Document } from '@/services/documents.service'
+import { safeHttpsLink } from '@/lib/url'
 import styles from './DocumentDetail.module.scss'
 
 interface Props {
@@ -42,6 +43,7 @@ export default function DocumentDetail({ document, isLoading }: Props) {
 
   const statusMessage = STATUS_MESSAGES[document.content_status]
   const size = formatSize(document.size_bytes)
+  const driveLink = safeHttpsLink(document.web_view_link)
 
   return (
     <div className={styles.detail}>
@@ -51,11 +53,11 @@ export default function DocumentDetail({ document, isLoading }: Props) {
           <span><strong>Type:</strong> {document.mime_type}</span>
           {size && <span><strong>Size:</strong> {size}</span>}
           <span><strong>Modified:</strong> {formatFullDate(document.drive_modified_time)}</span>
-          {document.web_view_link && (
+          {driveLink && (
             <span>
               <a
                 className={styles.driveLink}
-                href={document.web_view_link}
+                href={driveLink}
                 target="_blank"
                 rel="noopener noreferrer"
               >

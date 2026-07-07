@@ -2,20 +2,8 @@ import { useState, type FormEvent } from 'react'
 import { useNavigate } from 'react-router-dom'
 import { useSearch } from '@/hooks/useSearch'
 import type { SearchResult } from '@/services/search.service'
+import { safeHttpsLink } from '@/lib/url'
 import styles from './SearchPage.module.scss'
-
-// Only render web_view_link as a clickable anchor when it parses to an https URL. Anything else
-// (null, relative, javascript:, data:, http:) is rendered as plain text — never an anchor. This
-// blocks javascript:/data: URL injection from untrusted citation metadata.
-function safeHttpsLink(link: string | null): string | null {
-  if (!link) return null
-  try {
-    const url = new URL(link)
-    return url.protocol === 'https:' ? url.href : null
-  } catch {
-    return null
-  }
-}
 
 function formatSimilarity(similarity: number): string {
   if (!Number.isFinite(similarity)) return ''
@@ -80,7 +68,7 @@ export default function SearchPage() {
             type="text"
             className={styles.searchInput}
             placeholder="Ask a question…"
-            aria-label="Search your collected email and files"
+            aria-label="Search your collected files"
             value={query}
             onChange={(e) => {
               setQuery(e.target.value)
@@ -93,7 +81,7 @@ export default function SearchPage() {
         </form>
 
         {showEmptyState && (
-          <p className={styles.empty}>Ask a question about your collected email and files</p>
+          <p className={styles.empty}>Ask a question about your collected files</p>
         )}
         {isPending && <p className={styles.loading}>Searching…</p>}
         {error && (
