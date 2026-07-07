@@ -309,9 +309,10 @@ async function persistPage(
 }
 
 Deno.serve(async (req: Request) => {
-  const cronSecret = Deno.env.get('CRON_SECRET')!
+  const cronSecret = Deno.env.get('CRON_SECRET')
   const authHeader = req.headers.get('Authorization')
-  if (authHeader !== `Bearer ${cronSecret}`) {
+  // Fail CLOSED: a missing/empty secret must never accept `Bearer undefined`/`Bearer `.
+  if (!cronSecret || authHeader !== `Bearer ${cronSecret}`) {
     return new Response('Unauthorized', { status: 401 })
   }
 

@@ -46,7 +46,7 @@ function renderPage() {
 }
 
 function submit() {
-  const input = screen.getByLabelText(/search your collected email and files/i)
+  const input = screen.getByLabelText(/search your collected files/i)
   fireEvent.change(input, { target: { value: 'what is the budget' } })
   fireEvent.click(screen.getByRole('button', { name: /search/i }))
 }
@@ -59,7 +59,7 @@ beforeEach(() => {
 describe('SearchPage', () => {
   it('renders the empty/prompt state initially', () => {
     renderPage()
-    expect(screen.getByText(/ask a question about your collected email and files/i)).toBeInTheDocument()
+    expect(screen.getByText(/ask a question about your collected files/i)).toBeInTheDocument()
   })
 
   it('renders the loading state while pending', () => {
@@ -153,7 +153,7 @@ describe('SearchPage', () => {
 
   it('does NOT submit when the query is empty/whitespace', () => {
     renderPage()
-    const input = screen.getByLabelText(/search your collected email and files/i)
+    const input = screen.getByLabelText(/search your collected files/i)
     fireEvent.change(input, { target: { value: '   ' } })
     fireEvent.click(screen.getByRole('button', { name: /search/i }))
     expect(mockMutate).not.toHaveBeenCalled()
